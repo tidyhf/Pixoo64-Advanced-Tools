@@ -1,8 +1,8 @@
-
 # ✨ Pixoo 64 Advanced Tools ✨
 
 An advanced Python toolset for customizing and interacting with the Divoom Pixoo 64 display.
 
+![hippo](https://i.imgur.com/Ly2hGne.gif)
 ---
 
 ## 🚀 Overview
