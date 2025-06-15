@@ -6,3 +6,4 @@ soundcard
 pynvml
 opencv-python
 feedparser
+requests

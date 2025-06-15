@@ -2,18 +2,20 @@
 # Pixoo 64 Advanced Tools by Doug Farmer
 #
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
-# This script allows for screen streaming, video playback, single image/GIF display, mixed-media playlists,
-# a live system performance monitor, a powerful custom text displayer, a live audio visualizer, and an RSS feed reader.
+# This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
+# mixed-media playlists, a live system performance monitor, a powerful custom text displayer,
+# a live audio visualizer, and an RSS feed reader.
 #
 # Main libraries used:
 # - tkinter: For the GUI components.
-# - Pillow (PIL): For all image processing, including GIFs and text rendering.
+# - Pillow (PIL): For all image processing.
 # - pixoo: For communicating with the Pixoo 64 device.
 # - psutil: For fetching system CPU, RAM, and Network statistics.
 # - pynvml: For fetching NVIDIA GPU statistics.
 # - numpy & soundcard: For the audio visualizer.
-# - opencv-python: For video file decoding and playback.
+# - opencv-python: For video file decoding.
 # - feedparser: For parsing RSS and Atom feeds.
+# - requests: For making API calls to web services.
 #
 import logging
 import time
@@ -30,6 +32,9 @@ import soundcard as sc
 import warnings
 import cv2
 import feedparser
+import requests
+import io
+
 try:
     import pynvml
     pynvml.nvmlInit()
@@ -60,7 +65,8 @@ text_active = threading.Event()
 equalizer_active = threading.Event()
 video_active = threading.Event()
 rss_active = threading.Event()
-ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active]
+ai_image_active = threading.Event()
+ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active]
 
 show_grid = True
 resize_method = Image.Resampling.BICUBIC
@@ -88,18 +94,15 @@ filter_options = {
 # --- Configuration Management ---
 
 def load_config():
-    # Loads settings from the config file, creating it if it doesn't exist.
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config_data = json.load(f)
-            # Load RSS feeds if they exist in the config
             global rss_feed_urls
             rss_feed_urls = config_data.get('rss_feeds', [])
             return config_data
     return {}
 
 def save_config(data):
-    # Saves the given data to the config file.
     data['rss_feeds'] = rss_feed_urls
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data, f, indent=4)
@@ -251,7 +254,6 @@ def advanced_sysmon_task(options):
             logging.error(f"Error in system monitor: {e}"); sysmon_active.clear(); break
 
 def format_speed(speed_in_kb):
-    # Formats speed in KB/s to MB/s if it's over a threshold.
     if speed_in_kb >= 1000:
         speed_in_mb = speed_in_kb / 1024
         return f"{speed_in_mb:.1f} MB/s"
@@ -387,7 +389,6 @@ def video_playback_task():
     logging.info("Video playback finished.")
 
 def text_wrap(text, font, max_width):
-    # Wraps text to fit within a specific pixel width.
     lines = []
     words = text.split()
     
@@ -396,7 +397,6 @@ def text_wrap(text, font, max_width):
 
     current_line = words[0]
     for word in words[1:]:
-        # Check the bounding box of the line with the new word
         if font.getbbox(current_line + " " + word)[2] <= max_width:
             current_line += " " + word
         else:
@@ -407,7 +407,6 @@ def text_wrap(text, font, max_width):
     return "\n".join(lines)
 
 def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
-    # This function scrolls text vertically from bottom to top.
     try:
         font = ImageFont.load_default()
         custom_font_path = font_path
@@ -417,9 +416,7 @@ def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
             except IOError: 
                 logging.warning(f"Could not load font: {custom_font_path}. Using default.")
         
-        # This is the main loop for continuous scrolling (for Text Display)
         while active_event.is_set():
-            # Create a dummy image and draw object to measure multiline text accurately
             temp_draw = ImageDraw.Draw(Image.new('RGB', (0,0)))
             left, top, right, bottom = temp_draw.textbbox((0,0), text_to_scroll, font=font)
             text_width, text_height = right - left, bottom - top
@@ -431,7 +428,6 @@ def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
             draw.text((-left, -top), text_to_scroll, font=font, fill=text_color, stroke_width=1, stroke_fill=outline_color)
             
             y = 64
-            # This inner loop handles one full pass of the text
             while active_event.is_set():
                 frame = Image.new('RGB', (64, 64), (0,0,0))
                 frame.paste(full_text_image, (x_pos, y), full_text_image) 
@@ -440,11 +436,10 @@ def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
                 
                 y -= 1
                 if y < -text_height:
-                    break # End of this pass
+                    break
                 
                 active_event.wait(delay_ms / 1000.0)
 
-            # For RSS feeds, we break after one pass. For Text Display, we loop.
             if active_event == rss_active:
                 break 
 
@@ -456,7 +451,6 @@ def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
 
 
 def rss_task(delay_between_headlines, scroll_speed_ms):
-    # The main background task for fetching and displaying RSS feeds.
     try:
         rss_font_size = 12
         rss_font = ImageFont.load_default()
@@ -609,6 +603,54 @@ def draw_vortex(data):
             new_particles.append([radius, angle, speed])
     vortex_particles = new_particles
     return img
+
+def ai_image_generation_task(prompt, use_pixel_style, use_hd):
+    # This task handles the API call to Pollinations.ai
+    ai_image_active.set()
+    ai_status_label.config(text="Status: Generating...")
+    
+    try:
+        base_url = "https://image.pollinations.ai/prompt/"
+        
+        # Modify the prompt based on user selections
+        final_prompt = prompt
+        if use_pixel_style:
+            final_prompt += ", pixel art, 8-bit, sprite"
+        if use_hd:
+            final_prompt += ", 4k, ultra detailed"
+            
+        # URL encode the prompt to handle special characters
+        encoded_prompt = requests.utils.quote(final_prompt)
+        
+        full_url = f"{base_url}{encoded_prompt}"
+        logging.info(f"Requesting AI image from URL: {full_url}")
+        
+        response = requests.get(full_url, timeout=90) # 90 second timeout
+        
+        if response.status_code == 200:
+            image_data = response.content
+            ai_image = Image.open(io.BytesIO(image_data))
+            
+            processed = process_image(ai_image)
+            if pixoo:
+                pixoo.draw_image(processed)
+                pixoo.push()
+            update_preview_label(processed)
+            ai_status_label.config(text="Status: Done!")
+        else:
+            messagebox.showerror("API Error", f"Failed to generate image. Status code: {response.status_code}\n{response.text}")
+            ai_status_label.config(text="Status: Error")
+
+    except requests.exceptions.RequestException as e:
+        messagebox.showerror("Network Error", f"Could not connect to the image generation service: {e}")
+        ai_status_label.config(text="Status: Network Error")
+    except Exception as e:
+        logging.error(f"Error during AI image generation: {e}")
+        messagebox.showerror("Error", f"An unexpected error occurred: {e}")
+        ai_status_label.config(text="Status: Error")
+    finally:
+        ai_image_active.clear()
+
 
 #
 # GUI Actions
@@ -856,6 +898,22 @@ def start_rss_feed():
     rss_active.set()
     threading.Thread(target=rss_task, args=(delay, speed), daemon=True).start()
 
+def start_ai_image_generation():
+    stop_all_activity()
+    prompt = ai_prompt_entry.get("1.0", "end-1c").strip()
+    if not prompt:
+        messagebox.showwarning("Empty Prompt", "Please enter a description for the image.")
+        return
+    
+    if ai_image_active.is_set():
+        messagebox.showinfo("In Progress", "An image is already being generated.")
+        return
+    
+    use_pixel = pixel_style_var.get()
+    use_hd = hd_style_var.get()
+    
+    threading.Thread(target=ai_image_generation_task, args=(prompt, use_pixel, use_hd), daemon=True).start()
+
 #
 # GUI Setup
 #
@@ -877,6 +935,7 @@ tab5 = ttk.Frame(notebook, padding=10)
 tab6 = ttk.Frame(notebook, padding=10)
 tab3 = ttk.Frame(notebook, padding=10)
 tab8 = ttk.Frame(notebook, padding=10)
+tab9 = ttk.Frame(notebook, padding=10) # AI Image Tab
 tab4 = ttk.Frame(notebook, padding=10)
 
 # Add tabs to notebook in the correct order
@@ -887,6 +946,7 @@ notebook.add(tab5, text='Text Display')
 notebook.add(tab6, text='Equalizer')
 notebook.add(tab3, text='System Monitor')
 notebook.add(tab8, text='RSS Feeds')
+notebook.add(tab9, text='AI Image Gen')
 notebook.add(tab4, text='Credits')
 
 
@@ -940,7 +1000,7 @@ ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font)
 discord_frame = ttk.Frame(credits_center_frame); discord_frame.pack(pady=5); ttk.Label(discord_frame, text="Discord:", font=body_font).pack(side=tk.LEFT); ttk.Label(discord_frame, text="wtfyd", font=link_font, foreground="#5865F2").pack(side=tk.LEFT)
 ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="Special Thanks", font=header_font).pack()
 ttk.Label(credits_center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech. This tool was built and expanded upon his great work.", font=body_font, wraplength=400, justify="center").pack(pady=5)
-ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="More features are coming soon...", font=author_font).pack(pady=10)
+ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="https://github.com/tidyhf/Pixoo64-Advanced-Tools", font=author_font).pack(pady=10)
 
 # Tab 5: Text Display
 t5_left = ttk.Frame(tab5); t5_left.pack(side=tk.LEFT, fill="both", expand=True, padx=(0,10)); t5_right = ttk.Frame(tab5); t5_right.pack(side=tk.LEFT, fill="y")
@@ -1009,6 +1069,24 @@ rss_speed_spinbox = tk.Spinbox(settings_frame, from_=10, to=1000, increment=10, 
 rss_speed_spinbox.pack(fill="x", pady=2)
 rss_speed_spinbox.delete(0, "end"); rss_speed_spinbox.insert(0, "35")
 ttk.Button(rss_right_frame, text="START RSS FEED", command=start_rss_feed, style="Accent.TButton").pack(fill="x", pady=(10,2), ipady=5)
+
+# Tab 9: AI Image Generation
+ai_main_frame = ttk.Frame(tab9, padding=5)
+ai_main_frame.pack(fill="both", expand=True)
+ai_prompt_frame = ttk.LabelFrame(ai_main_frame, text="Image Description Prompt", padding=5)
+ai_prompt_frame.pack(fill="x")
+ai_prompt_entry = tk.Text(ai_prompt_frame, height=4, wrap="word")
+ai_prompt_entry.pack(fill="x", expand=True)
+ai_options_frame = ttk.LabelFrame(ai_main_frame, text="Generation Options", padding=5)
+ai_options_frame.pack(fill="x", pady=10)
+pixel_style_var = tk.BooleanVar(value=True)
+hd_style_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(ai_options_frame, text="Pixel Art Style (Recommended)", variable=pixel_style_var).pack(anchor="w")
+ttk.Checkbutton(ai_options_frame, text="HD Quality (Slower, uses more keywords)", variable=hd_style_var).pack(anchor="w")
+ai_status_label = ttk.Label(ai_main_frame, text="Status: Ready")
+ai_status_label.pack(pady=5)
+ttk.Button(ai_main_frame, text="GENERATE IMAGE", command=start_ai_image_generation, style="Accent.TButton").pack(fill="x", ipady=10)
+ttk.Label(ai_main_frame, text="Powered by Pollinations.ai. Generation may take 30-90 seconds.", justify="center").pack(pady=10)
 
 
 # This button is always visible at the bottom.
