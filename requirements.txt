@@ -3,3 +3,6 @@ Pillow
 psutil
 numpy
 soundcard
+pynvml
+opencv-python
+feedparser

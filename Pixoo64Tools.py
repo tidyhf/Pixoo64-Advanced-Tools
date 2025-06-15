@@ -1,16 +1,19 @@
 #
-# Pixoo 64 Advanced Tools
+# Pixoo 64 Advanced Tools by Doug Farmer
 #
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
-# This script allows for screen streaming, single image/GIF display, mixed-media playlists,
-# a live system performance monitor, a powerful custom text displayer, and a live audio visualizer.
+# This script allows for screen streaming, video playback, single image/GIF display, mixed-media playlists,
+# a live system performance monitor, a powerful custom text displayer, a live audio visualizer, and an RSS feed reader.
 #
 # Main libraries used:
 # - tkinter: For the GUI components.
 # - Pillow (PIL): For all image processing, including GIFs and text rendering.
-# - pixoo-python: For communicating with the Pixoo 64 device.
-# - psutil: For fetching system CPU and RAM statistics.
+# - pixoo: For communicating with the Pixoo 64 device.
+# - psutil: For fetching system CPU, RAM, and Network statistics.
+# - pynvml: For fetching NVIDIA GPU statistics.
 # - numpy & soundcard: For the audio visualizer.
+# - opencv-python: For video file decoding and playback.
+# - feedparser: For parsing RSS and Atom feeds.
 #
 import logging
 import time
@@ -25,11 +28,19 @@ import psutil
 import numpy as np
 import soundcard as sc
 import warnings
+import cv2
+import feedparser
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    NVIDIA_GPU_SUPPORT = True
+except Exception:
+    NVIDIA_GPU_SUPPORT = False
 
-# Suppress the specific, harmless warning from the soundcard library
+# Suppress a specific, harmless warning from the soundcard library
 warnings.filterwarnings('ignore', category=sc.SoundcardRuntimeWarning)
 
-# Sets up how logs are displayed. Useful for debugging.
+# Sets up how logs are displayed
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -47,13 +58,17 @@ gif_active = threading.Event()
 sysmon_active = threading.Event()
 text_active = threading.Event()
 equalizer_active = threading.Event()
-ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active]
+video_active = threading.Event()
+rss_active = threading.Event()
+ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active]
 
 show_grid = True
 resize_method = Image.Resampling.BICUBIC
 last_source_image = None
 playlist_files = []
+rss_feed_urls = []
 current_gif_path = None
+current_video_path = None
 processed_gif_frames = [] 
 text_color = (255, 255, 255)
 outline_color = (0, 0, 0)
@@ -73,14 +88,19 @@ filter_options = {
 # --- Configuration Management ---
 
 def load_config():
-    """Loads settings from the config file, creating it if it doesn't exist."""
+    # Loads settings from the config file, creating it if it doesn't exist.
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+            config_data = json.load(f)
+            # Load RSS feeds if they exist in the config
+            global rss_feed_urls
+            rss_feed_urls = config_data.get('rss_feeds', [])
+            return config_data
     return {}
 
 def save_config(data):
-    """Saves the given data to the config file."""
+    # Saves the given data to the config file.
+    data['rss_feeds'] = rss_feed_urls
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
@@ -180,27 +200,82 @@ def screen_capture_task():
             logging.error(f"Error during screen capture: {e}"); streaming.clear(); break
         time.sleep(1/60)
 
-def sysmon_task():
-    font = None; psutil.cpu_percent(interval=None) 
+def advanced_sysmon_task(options):
+    tiny_font = ImageFont.load_default()
+    last_net_io = psutil.net_io_counters()
+    last_time = time.time()
+
     while sysmon_active.is_set():
         if pixoo is None: time.sleep(1); continue
+        
+        stats = {}
+        if options["cpu_total"] or options["cpu_cores"]:
+             stats["cpu_total"] = psutil.cpu_percent(interval=1)
+             if options["cpu_cores"]:
+                 stats["cpu_cores"] = psutil.cpu_percent(interval=None, percpu=True)
+        else:
+             time.sleep(1) 
+
+        if options["ram"]: stats["ram"] = psutil.virtual_memory().percent
+        
+        if options["gpu"]:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+                gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                stats["gpu"] = {"util": gpu_util, "temp": gpu_temp}
+            except Exception as e:
+                logging.warning(f"Could not get NVIDIA GPU stats: {e}")
+                stats["gpu"] = None
+
+        if options["network"]:
+            current_net_io = psutil.net_io_counters()
+            current_time = time.time()
+            elapsed_time = current_time - last_time
+            
+            if elapsed_time > 0:
+                upload_speed = (current_net_io.bytes_sent - last_net_io.bytes_sent) / elapsed_time / 1024
+                download_speed = (current_net_io.bytes_recv - last_net_io.bytes_recv) / elapsed_time / 1024
+                stats["network"] = {"up": upload_speed, "down": download_speed}
+            
+            last_net_io = current_net_io
+            last_time = current_time
+
         try:
-            cpu_percent, mem_percent = psutil.cpu_percent(interval=1), psutil.virtual_memory().percent
-            img = Image.new('RGB', (64, 64), 'black'); draw = ImageDraw.Draw(img)
-            draw.text((4, 5), "CPU", fill=(255, 255, 255), font=font)
-            cpu_bar_height = int(60 * (cpu_percent / 100))
-            draw.rectangle([5, 62 - cpu_bar_height, 25, 62], fill=(0, 150, 255))
-            draw.text((4, 50 - cpu_bar_height), f"{int(cpu_percent)}%", fill='white', font=font)
-            draw.text((36, 5), "RAM", fill=(255, 255, 255), font=font)
-            mem_bar_height = int(60 * (mem_percent / 100))
-            draw.rectangle([38, 62 - mem_bar_height, 58, 62], fill=(0, 255, 150))
-            draw.text((36, 50 - mem_bar_height), f"{int(mem_percent)}%", fill='white', font=font)
+            img = Image.new('RGB', (64, 64), 'black')
+            draw_sysmon_dashboard(img, stats, tiny_font)
+            
             pixoo.draw_image(img); pixoo.push()
             update_preview_label(img)
         except Exception as e:
-            logging.error(f"Error in system monitor: {e}"); sysmon_active.clear()
-    logging.info("System monitor stopped.")
+            logging.error(f"Error in system monitor: {e}"); sysmon_active.clear(); break
 
+def format_speed(speed_in_kb):
+    # Formats speed in KB/s to MB/s if it's over a threshold.
+    if speed_in_kb >= 1000:
+        speed_in_mb = speed_in_kb / 1024
+        return f"{speed_in_mb:.1f} MB/s"
+    else:
+        return f"{speed_in_kb:.0f} KB/s"
+
+def draw_sysmon_dashboard(img, stats, font):
+    draw = ImageDraw.Draw(img)
+    y_offset = 2
+    if "cpu_total" in stats:
+        draw.text((2, y_offset), f"CPU: {stats['cpu_total']:.0f}%", font=font, fill="white")
+        y_offset += 10
+    if "ram" in stats:
+        draw.text((2, y_offset), f"RAM: {stats['ram']:.0f}%", font=font, fill="white")
+        y_offset += 10
+    if stats.get("gpu"):
+        draw.text((2, y_offset), f"GPU: {stats['gpu']['util']}%", font=font, fill="white")
+        y_offset += 10
+    if "network" in stats:
+        up_text = format_speed(stats['network']['up'])
+        down_text = format_speed(stats['network']['down'])
+        draw.text((2, y_offset), f"UP: {up_text}", font=font, fill="white")
+        y_offset += 10
+        draw.text((2, y_offset), f"DN: {down_text}", font=font, fill="white")
 
 def play_gif_once_in_playlist(gif_path):
     MIN_FRAME_DURATION_S = 0.02
@@ -280,30 +355,158 @@ def gif_playback_task():
         if not gif_active.is_set(): break
     logging.info("GIF playback finished."); toggle_processing_controls(enabled=True)
 
-def text_animation_task(text, font, text_color, outline_color, x_pos, y_pos, delay_ms):
+def video_playback_task():
+    if not current_video_path: return
+    
     try:
-        left, top, right, bottom = font.getbbox(text)
-        text_width, text_height = right - left, bottom - top
-        
-        full_text_image = Image.new('RGBA', (text_width, text_height))
-        draw = ImageDraw.Draw(full_text_image)
-        draw.text((0, -top), text, font=font, fill=text_color, stroke_width=1, stroke_fill=outline_color)
-        
-        x = 64
-        while text_active.is_set():
-            frame = Image.new('RGB', (64, 64), (0,0,0))
-            frame.paste(full_text_image, (x, y_pos), full_text_image) 
-            pixoo.draw_image(frame); pixoo.push()
-            update_preview_label(frame)
+        cap = cv2.VideoCapture(current_video_path)
+        if not cap.isOpened():
+            messagebox.showerror("Video Error", "Could not open video file.")
+            video_active.clear()
+            return
             
-            x -= 1 # Move left
-            if x < -text_width: # Reset when text is fully off-screen.
-                x = 64
+        while video_active.is_set() and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
             
-            time.sleep(delay_ms / 1000.0)
+            processed = process_image(pil_image)
+            pixoo.draw_image(processed); pixoo.push()
+            update_preview_label(processed)
+        
+        cap.release()
     except Exception as e:
-        logging.error(f"Error during text animation: {e}")
-    toggle_processing_controls(enabled=True)
+        logging.error(f"Error during video playback: {e}")
+        messagebox.showerror("Video Error", f"An error occurred during playback: {e}")
+    
+    video_active.clear()
+    logging.info("Video playback finished.")
+
+def text_wrap(text, font, max_width):
+    # Wraps text to fit within a specific pixel width.
+    lines = []
+    words = text.split()
+    
+    if not words:
+        return ""
+
+    current_line = words[0]
+    for word in words[1:]:
+        # Check the bounding box of the line with the new word
+        if font.getbbox(current_line + " " + word)[2] <= max_width:
+            current_line += " " + word
+        else:
+            lines.append(current_line)
+            current_line = word
+    lines.append(current_line)
+    
+    return "\n".join(lines)
+
+def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
+    # This function scrolls text vertically from bottom to top.
+    try:
+        font = ImageFont.load_default()
+        custom_font_path = font_path
+        if custom_font_path:
+            try: 
+                font = ImageFont.truetype(custom_font_path, font_size)
+            except IOError: 
+                logging.warning(f"Could not load font: {custom_font_path}. Using default.")
+        
+        # This is the main loop for continuous scrolling (for Text Display)
+        while active_event.is_set():
+            # Create a dummy image and draw object to measure multiline text accurately
+            temp_draw = ImageDraw.Draw(Image.new('RGB', (0,0)))
+            left, top, right, bottom = temp_draw.textbbox((0,0), text_to_scroll, font=font)
+            text_width, text_height = right - left, bottom - top
+
+            x_pos = (64 - text_width) // 2 
+
+            full_text_image = Image.new('RGBA', (text_width, text_height))
+            draw = ImageDraw.Draw(full_text_image)
+            draw.text((-left, -top), text_to_scroll, font=font, fill=text_color, stroke_width=1, stroke_fill=outline_color)
+            
+            y = 64
+            # This inner loop handles one full pass of the text
+            while active_event.is_set():
+                frame = Image.new('RGB', (64, 64), (0,0,0))
+                frame.paste(full_text_image, (x_pos, y), full_text_image) 
+                if pixoo: pixoo.draw_image(frame); pixoo.push()
+                update_preview_label(frame)
+                
+                y -= 1
+                if y < -text_height:
+                    break # End of this pass
+                
+                active_event.wait(delay_ms / 1000.0)
+
+            # For RSS feeds, we break after one pass. For Text Display, we loop.
+            if active_event == rss_active:
+                break 
+
+    except Exception as e:
+        logging.error(f"Error during scrolling text task: {e}")
+    
+    if active_event == text_active:
+        toggle_processing_controls(enabled=True)
+
+
+def rss_task(delay_between_headlines, scroll_speed_ms):
+    # The main background task for fetching and displaying RSS feeds.
+    try:
+        rss_font_size = 12
+        rss_font = ImageFont.load_default()
+        if font_path:
+            try: 
+                rss_font = ImageFont.truetype(font_path, rss_font_size)
+            except IOError: 
+                logging.warning(f"Could not load custom font for RSS. Using default.")
+    except Exception as e:
+        logging.error(f"Failed to load font for RSS task: {e}")
+        rss_font = ImageFont.load_default()
+
+    while rss_active.is_set():
+        if not rss_feed_urls:
+            logging.warning("RSS feed list is empty, stopping.")
+            messagebox.showwarning("Empty", "Your RSS feed list is empty.")
+            break
+
+        logging.info("Starting new RSS feed cycle.")
+        for url in rss_feed_urls:
+            if not rss_active.is_set(): break
+            
+            logging.info(f"Fetching RSS feed: {url}")
+            try:
+                feed = feedparser.parse(url, agent="Pixoo64AdvancedTools/1.0")
+                if feed.bozo:
+                    logging.warning(f"Feed may be malformed: {url}, Bozo reason: {feed.bozo_exception}")
+
+                for entry in feed.entries:
+                    if not rss_active.is_set(): break
+                    
+                    headline = entry.title
+                    wrapped_headline = text_wrap(headline, rss_font, 64)
+                    logging.info(f"Displaying headline: {headline}")
+                    scrolling_text_task(wrapped_headline, rss_font_size, scroll_speed_ms, rss_active)
+                    
+                    if rss_active.is_set():
+                        rss_active.wait(delay_between_headlines)
+
+            except Exception as e:
+                logging.error(f"Failed to fetch or parse RSS feed {url}: {e}")
+                if rss_active.is_set():
+                    rss_active.wait(5)
+        
+        logging.info("Finished RSS feed cycle.")
+        if rss_active.is_set():
+             rss_active.wait(60)
+
+    logging.info("RSS Feed task stopped.")
+
 
 def equalizer_task(device_id, effect):
     global vortex_angle, vortex_particles
@@ -335,8 +538,6 @@ def equalizer_task(device_id, effect):
         logging.error(f"Audio visualizer failed: {e}")
         messagebox.showerror("Visualizer Error", f"The audio visualizer failed. The selected device may no longer be available.\n\nError: {e}")
     equalizer_active.clear()
-
-# --- Visualizer Drawing Functions ---
 
 def draw_classic_bars(data, bar_heights, num_bars=16):
     fft_magnitude = np.abs(np.fft.rfft(data * np.hanning(len(data))))
@@ -409,9 +610,8 @@ def draw_vortex(data):
     vortex_particles = new_particles
     return img
 
-
 #
-# GUI Actions (functions called by button clicks)
+# GUI Actions
 #
 
 def on_connect_button_click():
@@ -425,14 +625,36 @@ def toggle_processing_controls(enabled=True):
         widget.config(state=state)
     crop_checkbutton.config(state="normal" if enabled else "disabled")
 
-
 def start_streaming(): stop_all_activity(); streaming.set(); threading.Thread(target=screen_capture_task, daemon=True).start()
-def start_sysmon(): stop_all_activity(); sysmon_active.set(); threading.Thread(target=sysmon_task, daemon=True).start()
+
+def start_advanced_sysmon():
+    stop_all_activity()
+    options = {
+        "cpu_total": cpu_total_var.get(),
+        "ram": ram_var.get(),
+        "gpu": gpu_var.get(),
+        "network": network_var.get(),
+        "cpu_cores": cpu_cores_var.get()
+    }
+    if not any(options.values()):
+        messagebox.showwarning("No Selection", "Please select at least one metric to monitor.")
+        return
+    
+    if options["gpu"] and not NVIDIA_GPU_SUPPORT:
+        messagebox.showerror("GPU Error", "NVIDIA drivers and the pynvml library are required for GPU monitoring.")
+        gpu_var.set(False)
+        return
+
+    sysmon_active.set()
+    threading.Thread(target=advanced_sysmon_task, args=(options,), daemon=True).start()
 
 def browse_image():
     stop_all_activity(); path = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp")])
     if not path: return
-    try: image = Image.open(path).convert("RGB"); processed = process_image(image); pixoo.draw_image(processed); pixoo.push(); update_preview_label(processed)
+    try: 
+        image = Image.open(path).convert("RGB"); processed = process_image(image)
+        if pixoo: pixoo.draw_image(processed); pixoo.push()
+        update_preview_label(processed)
     except Exception as e: messagebox.showerror("Error", f"Failed to process image: {e}")
 
 def browse_gif():
@@ -440,8 +662,38 @@ def browse_gif():
     if not path: return
     current_gif_path = path; gif_path_label.config(text=f"Selected: {path.split('/')[-1]}")
     try:
-        with Image.open(path) as gif: processed = process_image(gif.convert("RGB")); update_preview_label(processed)
+        with Image.open(path) as gif: 
+            preview_frame = gif.convert("RGB")
+            processed = process_image(preview_frame)
+            update_preview_label(processed)
     except Exception as e: messagebox.showerror("Error", f"Failed to load GIF preview: {e}")
+
+def browse_video():
+    global current_video_path
+    stop_all_activity()
+    path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4 *.mkv *.avi *.mov")])
+    if not path: return
+    current_video_path = path
+    video_path_label.config(text=f"Selected: {os.path.basename(path)}")
+    try:
+        cap = cv2.VideoCapture(path)
+        ret, frame = cap.read()
+        if ret:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            processed = process_image(pil_image)
+            update_preview_label(processed)
+        cap.release()
+    except Exception as e:
+        logging.error(f"Failed to load video preview: {e}")
+
+def start_video():
+    stop_all_activity()
+    if not current_video_path:
+        messagebox.showerror("Error", "No video file selected.")
+        return
+    video_active.set()
+    threading.Thread(target=video_playback_task, daemon=True).start()
 
 def start_gif():
     stop_all_activity();
@@ -521,22 +773,28 @@ def display_text():
     stop_all_activity()
     if pixoo is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
     text = text_entry.get("1.0", "end-1c")
-    if not text: pixoo.clear(); pixoo.push(); update_preview_label(Image.new('RGB', (64,64), (0,0,0))); return
-    size, x_pos, y_pos, delay_ms = int(font_size_spinbox.get()), int(pos_x_spinbox.get()), int(pos_y_spinbox.get()), int(anim_speed_spinbox.get())
+    if not text: 
+        if pixoo: pixoo.clear(); pixoo.push()
+        update_preview_label(Image.new('RGB', (64,64), (0,0,0)))
+        return
+        
+    font_size, x_pos, y_pos, delay_ms = int(font_size_spinbox.get()), int(pos_x_spinbox.get()), int(pos_y_spinbox.get()), int(anim_speed_spinbox.get())
     is_scrolling = scroll_text_var.get()
     
-    font = ImageFont.load_default()
-    if font_path:
-        try: font = ImageFont.truetype(font_path, size)
-        except IOError: messagebox.showwarning("Font Error", f"Could not load font. Using default.")
-    
     if not is_scrolling:
+        font = ImageFont.load_default()
+        if font_path:
+            try: font = ImageFont.truetype(font_path, font_size)
+            except IOError: messagebox.showwarning("Font Error", f"Could not load font. Using default.")
+        
         img = Image.new('RGB', (64, 64), (0,0,0)); draw = ImageDraw.Draw(img)
         draw.text((x_pos, y_pos), text, font=font, fill=text_color, stroke_width=1, stroke_fill=outline_color)
-        pixoo.draw_image(img); pixoo.push(); update_preview_label(img)
+        if pixoo: pixoo.draw_image(img); pixoo.push()
+        update_preview_label(img)
     else:
-        toggle_processing_controls(enabled=False); text_active.set()
-        threading.Thread(target=text_animation_task, args=(text, font, text_color, outline_color, x_pos, y_pos, delay_ms), daemon=True).start()
+        toggle_processing_controls(enabled=False)
+        text_active.set()
+        threading.Thread(target=scrolling_text_task, args=(text, font_size, delay_ms, text_active), daemon=True).start()
 
 def populate_audio_devices():
     device_listbox.set(''); device_listbox['values'] = []
@@ -547,7 +805,7 @@ def populate_audio_devices():
         if device_listbox['values']: device_listbox.set(device_listbox['values'][0])
     except Exception as e:
         logging.error(f"Could not get audio devices: {e}")
-        messagebox.showerror("Audio Error", "Could not find any audio devices. Please ensure you have soundcard drivers installed.")
+        messagebox.showerror("Audio Error", "Could not find any audio devices.")
 
 def start_equalizer():
     stop_all_activity()
@@ -566,6 +824,38 @@ def start_equalizer():
     except Exception as e:
         messagebox.showerror("Error", f"Failed to start visualizer on '{device_name}'.\n\n{e}")
 
+def add_rss_feed():
+    url = rss_url_entry.get().strip()
+    if not url: return
+    if url in rss_feed_urls:
+        messagebox.showinfo("Duplicate", "This feed URL is already in the list.")
+        return
+    
+    rss_feed_urls.append(url)
+    rss_listbox.insert(tk.END, url)
+    rss_url_entry.delete(0, tk.END)
+    save_config(app_config)
+
+def remove_rss_feed():
+    indices = sorted(rss_listbox.curselection(), reverse=True)
+    if not indices: return
+    for i in indices:
+        rss_listbox.delete(i)
+        rss_feed_urls.pop(i)
+    save_config(app_config)
+
+def start_rss_feed():
+    stop_all_activity()
+    if not rss_feed_urls:
+        messagebox.showwarning("Empty", "Please add at least one RSS feed URL.")
+        return
+    
+    delay = int(rss_delay_spinbox.get())
+    speed = int(rss_speed_spinbox.get())
+
+    rss_active.set()
+    threading.Thread(target=rss_task, args=(delay, speed), daemon=True).start()
+
 #
 # GUI Setup
 #
@@ -578,12 +868,29 @@ ttk.Label(ip_frame, text="Pixoo IP:").pack(side=tk.LEFT); ip_entry = ttk.Entry(i
 connect_button = ttk.Button(ip_frame, text="Connect", command=on_connect_button_click); connect_button.pack(side=tk.LEFT)
 
 notebook = ttk.Notebook(main_frame); notebook.pack(fill="both", expand=True, pady=5)
-tab1 = ttk.Frame(notebook, padding=10); notebook.add(tab1, text='Image & Stream')
-tab2 = ttk.Frame(notebook, padding=10); notebook.add(tab2, text='Playlist')
-tab5 = ttk.Frame(notebook, padding=10); notebook.add(tab5, text='Text Display')
-tab6 = ttk.Frame(notebook, padding=10); notebook.add(tab6, text='Equalizer')
-tab3 = ttk.Frame(notebook, padding=10); notebook.add(tab3, text='System Monitor')
-tab4 = ttk.Frame(notebook, padding=10); notebook.add(tab4, text='Credits')
+
+# Create all tab frames
+tab1 = ttk.Frame(notebook, padding=10)
+tab7 = ttk.Frame(notebook, padding=10)
+tab2 = ttk.Frame(notebook, padding=10)
+tab5 = ttk.Frame(notebook, padding=10)
+tab6 = ttk.Frame(notebook, padding=10)
+tab3 = ttk.Frame(notebook, padding=10)
+tab8 = ttk.Frame(notebook, padding=10)
+tab4 = ttk.Frame(notebook, padding=10)
+
+# Add tabs to notebook in the correct order
+notebook.add(tab1, text='Image & Stream')
+notebook.add(tab7, text='Video Player')
+notebook.add(tab2, text='Playlist')
+notebook.add(tab5, text='Text Display')
+notebook.add(tab6, text='Equalizer')
+notebook.add(tab3, text='System Monitor')
+notebook.add(tab8, text='RSS Feeds')
+notebook.add(tab4, text='Credits')
+
+
+# --- Populate Tabs ---
 
 # Tab 1: Image & Stream
 t1_left = ttk.Frame(tab1); t1_left.pack(side=tk.LEFT, fill="both", expand=True, padx=(0,10)); t1_right = ttk.Frame(tab1); t1_right.pack(side=tk.RIGHT, fill="both", expand=True)
@@ -610,7 +917,21 @@ ttk.Label(t2_right, text="Interval (s):").pack(); interval_spinbox = tk.Spinbox(
 ttk.Button(t2_right, text="START PLAYLIST", command=start_playlist, style="Accent.TButton").pack(fill="x", pady=(10,2)); style.configure("Accent.TButton", foreground="green")
 
 # Tab 3: System Monitor
-ttk.Label(tab3, text="Displays real-time CPU and RAM usage on your Pixoo.", justify="center").pack(pady=20); ttk.Button(tab3, text="START SYSTEM MONITOR", command=start_sysmon).pack(pady=10, ipady=10)
+sm_options_frame = ttk.LabelFrame(tab3, text="Metrics to Display (Dashboard Style)", padding=10)
+sm_options_frame.pack(fill="x")
+cpu_total_var = tk.BooleanVar(value=True)
+ram_var = tk.BooleanVar(value=True)
+gpu_var = tk.BooleanVar(value=NVIDIA_GPU_SUPPORT)
+network_var = tk.BooleanVar(value=False)
+cpu_cores_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(sm_options_frame, text="CPU (Total %)", variable=cpu_total_var).pack(anchor="w")
+ttk.Checkbutton(sm_options_frame, text="RAM (%)", variable=ram_var).pack(anchor="w")
+gpu_cb = ttk.Checkbutton(sm_options_frame, text="GPU (NVIDIA)", variable=gpu_var)
+gpu_cb.pack(anchor="w")
+if not NVIDIA_GPU_SUPPORT:
+    gpu_cb.config(state="disabled")
+ttk.Checkbutton(sm_options_frame, text="Network (KB/s)", variable=network_var).pack(anchor="w")
+ttk.Button(tab3, text="START MONITOR", command=start_advanced_sysmon, style="Accent.TButton").pack(pady=20, ipady=10)
 
 # Tab 4: Credits
 credits_center_frame = ttk.Frame(tab4); credits_center_frame.pack(expand=True)
@@ -645,12 +966,60 @@ ttk.Label(eq_bottom_frame, text="Effect:").pack(side="left", padx=5); eq_effect_
 ttk.Button(tab6, text="START VISUALIZER", command=start_equalizer, style="Accent.TButton").pack(pady=20, ipady=10)
 ttk.Label(tab6, text="This visualizer captures audio playing on your PC.\nSelect your main speakers or headphones from the list.", justify="center").pack(pady=10)
 
+# Tab 7: Video Player
+video_browse_frame = ttk.LabelFrame(tab7, text="Video File", padding=10)
+video_browse_frame.pack(fill="x")
+video_path_label = ttk.Label(video_browse_frame, text="No video selected.")
+video_path_label.pack(fill="x", pady=5)
+ttk.Button(video_browse_frame, text="Browse for Video File", command=browse_video).pack(fill="x")
+video_controls_frame = ttk.Frame(tab7, padding=10)
+video_controls_frame.pack(fill="x", pady=10)
+ttk.Button(video_controls_frame, text="PLAY VIDEO", command=start_video, style="Accent.TButton").pack(fill="x", ipady=10)
+ttk.Label(tab7, text="Supports most common video formats (mp4, mkv, avi, mov).\nVideo will loop automatically.", justify="center").pack(pady=10)
+
+# Tab 8: RSS Feeds
+rss_main_frame = ttk.Frame(tab8, padding=5)
+rss_main_frame.pack(fill="both", expand=True)
+rss_left_frame = ttk.Frame(rss_main_frame); rss_left_frame.pack(side=tk.LEFT, fill="both", expand=True, padx=(0, 10))
+rss_right_frame = ttk.Frame(rss_main_frame); rss_right_frame.pack(side=tk.RIGHT, fill="y")
+url_frame = ttk.LabelFrame(rss_left_frame, text="Add New RSS Feed URL", padding=5)
+url_frame.pack(fill="x")
+rss_url_entry = ttk.Entry(url_frame)
+rss_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+ttk.Button(url_frame, text="Add", command=add_rss_feed).pack(side="left")
+list_frame = ttk.LabelFrame(rss_left_frame, text="Your Feeds", padding=5)
+list_frame.pack(fill="both", expand=True, pady=10)
+rss_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)
+rss_listbox = tk.Listbox(list_frame, yscrollcommand=rss_scrollbar.set)
+rss_scrollbar.config(command=rss_listbox.yview)
+rss_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+rss_listbox.pack(side=tk.LEFT, fill="both", expand=True)
+for url in rss_feed_urls:
+    rss_listbox.insert(tk.END, url)
+ttk.Button(rss_right_frame, text="Remove Selected", command=remove_rss_feed).pack(fill="x", pady=2)
+ttk.Separator(rss_right_frame).pack(fill="x", pady=10)
+settings_frame = ttk.LabelFrame(rss_right_frame, text="Settings", padding=5)
+settings_frame.pack(fill="x")
+ttk.Label(settings_frame, text="Delay Per Headline (s):").pack()
+rss_delay_spinbox = tk.Spinbox(settings_frame, from_=1, to=300, width=10, justify=tk.CENTER)
+rss_delay_spinbox.pack(fill="x", pady=2)
+rss_delay_spinbox.delete(0, "end"); rss_delay_spinbox.insert(0, "5")
+ttk.Label(settings_frame, text="Scroll Speed (ms):").pack()
+rss_speed_spinbox = tk.Spinbox(settings_frame, from_=10, to=1000, increment=10, width=10, justify=tk.CENTER)
+rss_speed_spinbox.pack(fill="x", pady=2)
+rss_speed_spinbox.delete(0, "end"); rss_speed_spinbox.insert(0, "35")
+ttk.Button(rss_right_frame, text="START RSS FEED", command=start_rss_feed, style="Accent.TButton").pack(fill="x", pady=(10,2), ipady=5)
+
+
 # This button is always visible at the bottom.
 bottom_frame = ttk.Frame(main_frame); bottom_frame.pack(fill="x", pady=(10,0))
 ttk.Button(bottom_frame, text="STOP ALL ACTIVITY", command=stop_all_activity).pack(fill="x", ipady=5)
 
 def on_closing():
-    stop_all_activity(); root.destroy()
+    stop_all_activity()
+    if NVIDIA_GPU_SUPPORT:
+        pynvml.nvmlShutdown()
+    root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
 
