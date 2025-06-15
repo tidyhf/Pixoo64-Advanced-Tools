@@ -1,0 +1,5 @@
+pixoo
+Pillow
+psutil
+numpy
+soundcard
