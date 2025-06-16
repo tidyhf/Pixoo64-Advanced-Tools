@@ -4,7 +4,8 @@
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
 # This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
 # mixed-media playlists, a live system performance monitor, a powerful custom text displayer,
-# a live audio visualizer, an RSS feed reader, a live webcam viewer, and a live pixel art designer.
+# a live audio visualizer, an RSS feed reader, a live webcam viewer, a live pixel art designer,
+# and a Spotify 'Now Playing' integration with live lyrics.
 #
 # Main libraries used:
 # - customtkinter: For the modern GUI components.
@@ -16,6 +17,7 @@
 # - opencv-python: For video file decoding and webcam support.
 # - feedparser: For parsing RSS and Atom feeds.
 # - requests: For making API calls to web services.
+# - spotipy: For interfacing with the Spotify API.
 #
 import logging
 import time
@@ -42,6 +44,9 @@ import requests
 import io
 import sys
 import contextlib
+import webbrowser
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
 
 try:
     import pynvml
@@ -77,7 +82,8 @@ ai_image_active = threading.Event()
 webcam_active = threading.Event()
 webcam_slideshow_active = threading.Event()
 pixel_animation_active = threading.Event()
-ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active, pixel_animation_active]
+spotify_active = threading.Event()
+ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active, pixel_animation_active, spotify_active]
 
 show_grid = True
 resize_method = Image.Resampling.BICUBIC
@@ -105,6 +111,11 @@ current_frame_index = -1
 is_live_push_enabled = None
 onion_skin_enabled = None
 
+# Spotify state variables
+sp = None
+spotify_refresh_token = None
+current_spotify_track_id = None
+current_lyrics = None
 
 filter_options = {
     "NONE": None, "BLUR": ImageFilter.BLUR, "CONTOUR": ImageFilter.CONTOUR,
@@ -117,33 +128,36 @@ filter_options = {
 # --- Configuration Management ---
 
 def load_config():
+    global rss_feed_urls, spotify_refresh_token
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config_data = json.load(f)
-            global rss_feed_urls
             rss_feed_urls = config_data.get('rss_feeds', [])
+            # Load Spotify specific config
+            spotify_refresh_token = config_data.get('spotify_refresh_token', None)
+            DEFAULT_SPOTIFY_CLIENT_SECRET = config_data.get('spotify_client_secret', '')
             return config_data
     return {}
 
 def save_config(data):
+    global spotify_refresh_token
     data['rss_feeds'] = rss_feed_urls
+    # Save Spotify specific config
+    if app and hasattr(app, 'spotify_client_id_entry'):
+        data['spotify_client_id'] = app.spotify_client_id_entry.get()
+        data['spotify_client_secret'] = app.spotify_client_secret_entry.get()
+    data['spotify_refresh_token'] = spotify_refresh_token
+
     with open(CONFIG_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
 app_config = load_config()
 DEFAULT_PIXOO_IP = app_config.get('ip_address', '')
+DEFAULT_SPOTIFY_CLIENT_ID = app_config.get('spotify_client_id', '')
+DEFAULT_SPOTIFY_CLIENT_SECRET = app_config.get('spotify_client_secret', '')
 
-# --- Core Functions ---
-# NOTE: All backend logic functions (the tasks) remain identical to your original script.
-# They are omitted here for brevity but should be pasted back in.
-# To make this runnable, copy all of your original functions from
-# `stop_all_activity()` down to `export_animation_as_gif()` and paste them here.
-
-# <--- PASTE ALL YOUR ORIGINAL BACKEND FUNCTIONS HERE --- >
-# For this example to be self-contained, I've included them below.
 
 def stop_all_activity():
-    # A small modification to update the GUI state correctly
     global app
     if gif_active.is_set() or text_active.is_set():
         if app: app.toggle_processing_controls(enabled=True)
@@ -187,8 +201,6 @@ def update_preview_label(image: Image.Image):
     if app is None or app.preview_label is None: return
     try:
         preview_image = image.resize((384, 384), Image.Resampling.NEAREST)
-        # The grid is now drawn on the designer canvas, so we can skip it here
-        # preview_image = draw_grid(preview_image)
         preview_image_tk = customtkinter.CTkImage(light_image=preview_image, dark_image=preview_image, size=(384, 384))
         app.preview_label.configure(image=preview_image_tk)
     except Exception as e:
@@ -221,11 +233,6 @@ def refresh_preview():
         processed_image = process_image(last_source_image)
         update_preview_label(processed_image)
 
-#
-# All original background task functions would go here
-# e.g. screen_capture_task, advanced_sysmon_task, playlist_task, etc.
-# These functions are kept unchanged from your original script.
-#
 def screen_capture_task():
     while streaming.is_set():
         if pixoo is None: time.sleep(0.5); continue
@@ -865,11 +872,167 @@ def pixel_animation_task(delay_s):
 
     logging.info("Pixel animation task stopped.")
 
+def get_lyrics_threaded(artist, track):
+    global current_lyrics
+    logging.info(f"Searching lyrics for {track} by {artist}")
+    lyrics = get_lyrics(artist, track)
+    if lyrics:
+        logging.info(f"Found {len(lyrics)} lines of synced lyrics.")
+        current_lyrics = lyrics
+    else:
+        logging.warning("Could not find synced lyrics for the current track.")
+        current_lyrics = None
+
+
+def get_lyrics(artist, track):
+    """[ALPHA] Fetches and parses synced lyrics from lrclib.net."""
+    try:
+        # Sanitize inputs for URL
+        artist_clean = requests.utils.quote(artist)
+        track_clean = requests.utils.quote(track)
+
+        url = f"https://lrclib.net/api/get?artist_name={artist_clean}&track_name={track_clean}"
+        response = requests.get(url, timeout=10)
+
+        if response.status_code != 200:
+            logging.warning(f"lrclib.net API returned status {response.status_code}")
+            return None
+
+        data = response.json()
+        if not data or 'syncedLyrics' not in data or not data['syncedLyrics']:
+            return None
+
+        lrc_text = data['syncedLyrics']
+        parsed_lyrics = []
+        for line in lrc_text.splitlines():
+            if line.strip().startswith('[') and ']' in line:
+                try:
+                    time_str = line[line.find('[')+1:line.find(']')]
+                    lyric_str = line[line.find(']')+1:].strip()
+                    if not lyric_str: continue
+
+                    minutes, seconds = map(float, time_str.split(':'))
+                    total_ms = int((minutes * 60 + seconds) * 1000)
+                    parsed_lyrics.append((total_ms, lyric_str))
+                except ValueError:
+                    continue # Skip invalid lines
+        return sorted(parsed_lyrics)
+    except requests.RequestException as e:
+        logging.error(f"Network error while fetching lyrics: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"Failed to get or parse lyrics: {e}")
+        return None
+
+def spotify_task():
+    global sp, current_spotify_track_id, current_lyrics, lyrics_scroll_pos
+    spotify_font = ImageFont.load_default()
+
+    while spotify_active.is_set():
+        if not sp:
+            logging.warning("Spotify not authenticated. Stopping task.")
+            app.after(0, lambda: app.update_spotify_status("Authentication needed", "red"))
+            spotify_active.clear()
+            break
+        try:
+            track = sp.current_playback()
+
+            if not track or not track.get('is_playing'):
+                img = Image.new('RGB', (64, 64), 'black')
+                draw = ImageDraw.Draw(img)
+                draw.text((8, 24), "Spotify\nPaused", font=spotify_font, fill="grey", align="center", spacing=2)
+                if pixoo: pixoo.draw_image(img); pixoo.push()
+                update_preview_label(img)
+                time.sleep(2)
+                continue
+
+            item = track.get('item')
+            if not item or item['type'] != 'track':
+                img = Image.new('RGB', (64, 64), 'black')
+                draw = ImageDraw.Draw(img)
+                draw.text((4, 28), "Not a song", font=spotify_font, fill="grey")
+                if pixoo: pixoo.draw_image(img); pixoo.push()
+                update_preview_label(img)
+                time.sleep(5)
+                continue
+
+            track_id = item['id']
+            if track_id != current_spotify_track_id:
+                current_spotify_track_id = track_id
+                current_lyrics = None
+                lyrics_scroll_pos = 0
+                if app.spotify_show_lyrics_var.get():
+                    artist = item['artists'][0]['name']
+                    title = item['name']
+                    threading.Thread(target=get_lyrics_threaded, args=(artist, title), daemon=True).start()
+
+            # --- Drawing ---
+            img = Image.new('RGB', (64, 64), 'black')
+            draw = ImageDraw.Draw(img)
+            
+            # Album Art Background
+            art_url = item['album']['images'][0]['url']
+            art_response = requests.get(art_url)
+            art_image = Image.open(io.BytesIO(art_response.content)).convert("RGB")
+            art_processed = art_image.resize((64, 64), Image.Resampling.LANCZOS)
+            img.paste(art_processed, (0,0))
+            
+            # Dark overlay for readability
+            overlay = Image.new('RGBA', (64, 64), (0, 0, 0, 150))
+            img.paste(overlay, (0, 0), mask=overlay)
+
+            # Track and Artist Text
+            track_name = item['name']
+            artist_name = item['artists'][0]['name']
+            draw.text((3, 3), track_name, font=spotify_font, fill="white")
+            draw.text((3, 14), artist_name, font=spotify_font, fill="white")
+
+            # Progress Bar
+            progress_ms = track['progress_ms']
+            duration_ms = item['duration_ms']
+            progress_ratio = progress_ms / duration_ms if duration_ms > 0 else 0
+            bar_width = int(progress_ratio * 62)
+            draw.rectangle([0, 62, 63, 63], outline="#555", width=1)
+            if bar_width > 0:
+                draw.rectangle([1, 62, 1 + bar_width, 63], fill="#1DB954")
+
+             # Lyrics
+            if app.spotify_show_lyrics_var.get() and current_lyrics:
+                current_line = ""
+                for ts, text in current_lyrics:
+                    if progress_ms >= ts:
+                        current_line = text
+                    else:
+                        break
+
+                if current_line:
+                    wrapped_lyrics = text_wrap(current_line, spotify_font, 62)
+                    
+                    draw.text((2, 44), wrapped_lyrics, font=spotify_font, fill="white", spacing=1)
+
+            if pixoo: pixoo.draw_image(img); pixoo.push()
+            update_preview_label(img)
+            time.sleep(1)
+
+        except spotipy.exceptions.SpotifyException as e:
+            logging.error(f"Spotify API error: {e}")
+            if e.http_status == 401: # Unauthorized
+                app.after(0, lambda: app.update_spotify_status("Token expired, re-authenticating...", "orange"))
+                app.after(0, app.handle_spotify_auth, True)
+                time.sleep(5)
+            else:
+                time.sleep(10)
+        except Exception as e:
+            logging.error(f"Unexpected error in spotify_task: {e}")
+            time.sleep(5)
+            
+    logging.info("Spotify task stopped.")
+
 class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Pixoo 64 Advanced Tools 2.5")
+        self.title("Pixoo 64 Advanced Tools 2.6")
         self.geometry("1280x720")
 
         customtkinter.set_appearance_mode("Dark")
@@ -885,7 +1048,7 @@ class App(customtkinter.CTk):
 
         self.navigation_frame = customtkinter.CTkFrame(self, corner_radius=0)
         self.navigation_frame.grid(row=0, column=0, sticky="nsw")
-        self.navigation_frame.grid_rowconfigure(12, weight=1)
+        self.navigation_frame.grid_rowconfigure(13, weight=1)
         self.create_navigation_frame()
 
         self.content_frames = {}
@@ -897,15 +1060,18 @@ class App(customtkinter.CTk):
 
         self.after(100, self.populate_audio_devices)
         self.after(200, self.start_webcam_discovery)
+        
+        # Auto-connect and auto-auth on startup
         if DEFAULT_PIXOO_IP:
             threading.Thread(target=self.on_connect_button_click, args=(True,), daemon=True).start()
+        if spotify_refresh_token and DEFAULT_SPOTIFY_CLIENT_ID:
+            self.after(500, self.handle_spotify_auth, True)
 
 
     def create_navigation_frame(self):
-        """Populates the left-side navigation bar."""
         logo_label = customtkinter.CTkLabel(self.navigation_frame, text="Pixoo 64\nAdvanced Tools", font=self.title_font,
                                             padx=20, pady=20)
-        logo_label.grid(row=0, column=0, padx=20, pady=20)
+        logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
         buttons_info = {
             "image": ("🖼️ Image/Stream", self.create_image_stream_frame),
@@ -917,6 +1083,7 @@ class App(customtkinter.CTk):
             "equalizer": ("🎶 Equalizer", self.create_equalizer_frame),
             "sysmon": ("💻 Sys Monitor", self.create_sysmon_frame),
             "rss": ("📰 RSS Feeds", self.create_rss_frame),
+            "spotify": ("🎵 Spotify", self.create_spotify_frame),
             "ai": ("🤖 AI Image Gen", self.create_ai_frame),
             "credits": ("💡 Credits", self.create_credits_frame),
         }
@@ -940,11 +1107,10 @@ class App(customtkinter.CTk):
         self.stop_button = customtkinter.CTkButton(self.navigation_frame, text="🛑 STOP ALL ACTIVITY",
                                                    command=stop_all_activity, fg_color="#D32F2F", hover_color="#B71C1C",
                                                    font=self.large_font)
-        self.stop_button.grid(row=13, column=0, padx=10, pady=10, sticky="s")
+        self.stop_button.grid(row=14, column=0, padx=10, pady=10, sticky="s")
 
 
     def create_all_content_frames(self):
-        """Creates all the content frames upon startup."""
         for name, (_, create_func) in {
             "image": ("🖼️ Image/Stream", self.create_image_stream_frame),
             "video": ("▶️ Video Player", self.create_video_frame),
@@ -955,6 +1121,7 @@ class App(customtkinter.CTk):
             "equalizer": ("🎶 Equalizer", self.create_equalizer_frame),
             "sysmon": ("💻 Sys Monitor", self.create_sysmon_frame),
             "rss": ("📰 RSS Feeds", self.create_rss_frame),
+            "spotify": ("🎵 Spotify", self.create_spotify_frame),
             "ai": ("🤖 AI Image Gen", self.create_ai_frame),
             "credits": ("💡 Credits", self.create_credits_frame),
         }.items():
@@ -962,7 +1129,6 @@ class App(customtkinter.CTk):
 
 
     def select_frame_by_name(self, name):
-        """Shows the selected content frame and updates navigation button styles."""
         for btn_name, button in self.nav_buttons.items():
             button.configure(fg_color=("gray75", "gray25") if name == btn_name else "transparent")
 
@@ -987,12 +1153,15 @@ class App(customtkinter.CTk):
 
     def toggle_processing_controls(self, enabled=True):
         state = "normal" if enabled else "disabled"
-        self.resize_mode_combobox.configure(state=state)
-        self.filter_combobox.configure(state=state)
-        self.font_size_entry.configure(state=state)
-        self.pos_x_entry.configure(state=state)
-        self.pos_y_entry.configure(state=state)
-        self.crop_checkbutton.configure(state=state)
+        # This function seems to be for another tab, check if controls exist before configuring
+        if hasattr(self, 'resize_mode_combobox'):
+            self.resize_mode_combobox.configure(state=state)
+            self.filter_combobox.configure(state=state)
+            self.crop_checkbutton.configure(state=state)
+        if hasattr(self, 'font_size_entry'):
+            self.font_size_entry.configure(state=state)
+            self.pos_x_entry.configure(state=state)
+            self.pos_y_entry.configure(state=state)
 
     def start_streaming(self):
         stop_all_activity()
@@ -1281,6 +1450,99 @@ class App(customtkinter.CTk):
 
         rss_active.set()
         threading.Thread(target=rss_task, args=(delay, speed), daemon=True).start()
+
+    def handle_spotify_auth(self, silent=False):
+        global sp, spotify_refresh_token
+        client_id = self.spotify_client_id_entry.get().strip()
+        client_secret = self.spotify_client_secret_entry.get().strip()
+        if not client_id or not client_secret:
+            if not silent: messagebox.showerror("Error", "Please enter both a Spotify Client ID and Client Secret.")
+            return
+
+        redirect_uri = "http://127.0.0.1:8888/callback"
+        scope = "user-read-playback-state user-read-currently-playing"
+        cache_path = f".cache-{client_id}"
+
+        try:
+            auth_manager = SpotifyOAuth(client_id=client_id,
+                                        client_secret=client_secret,
+                                        redirect_uri=redirect_uri,
+                                        scope=scope,
+                                        open_browser=False,
+                                        cache_path=cache_path)
+
+            # Try to use a stored refresh token first
+            if spotify_refresh_token:
+                try:
+                    token_info = auth_manager.refresh_access_token(spotify_refresh_token)
+                    sp = spotipy.Spotify(auth=token_info['access_token'])
+                    user_info = sp.current_user()
+                    username = user_info['display_name']
+                    self.update_spotify_status(f"Authenticated as {username}", "green")
+                    save_config(app_config)
+                    if not silent: messagebox.showinfo("Success", f"Refreshed Spotify session for {username}")
+                    return
+                except Exception as e:
+                    logging.warning(f"Could not refresh token: {e}. Proceeding to full auth.")
+                    spotify_refresh_token = None
+
+            # --- Full Authentication Flow ---
+            auth_url = auth_manager.get_authorize_url()
+            webbrowser.open(auth_url)
+            logging.info(f"Opened auth URL in browser. Waiting for user to paste the redirect URL.")
+
+            redirected_url = customtkinter.CTkInputDialog(
+                text="After authorizing, your browser will show an error. Copy the entire URL from the address bar and paste it here:",
+                title="Spotify Authentication"
+            ).get_input()
+
+            if not redirected_url:
+                messagebox.showwarning("Cancelled", "Spotify authentication was cancelled.")
+                self.update_spotify_status("Authentication cancelled.", "orange")
+                return
+
+            # Parse the authorization code from the pasted URL
+            code = auth_manager.parse_response_code(redirected_url)
+
+            # Exchange the code for an access token
+            token_info = auth_manager.get_access_token(code, as_dict=True, check_cache=False)
+
+            if not token_info:
+                messagebox.showerror("Auth Error", "Could not get access token from the provided URL.")
+                self.update_spotify_status("Authentication failed.", "red")
+                return
+
+            # Save the new refresh token for future sessions and set up the client
+            spotify_refresh_token = token_info.get('refresh_token')
+            sp = spotipy.Spotify(auth=token_info['access_token'])
+
+            user_info = sp.current_user()
+            username = user_info['display_name']
+            self.update_spotify_status(f"Authenticated as {username}", "green")
+            save_config(app_config)
+            if not silent: messagebox.showinfo("Success", f"Successfully authenticated with Spotify as {username}")
+
+        except Exception as e:
+            logging.error(f"Spotify authentication failed: {e}", exc_info=True)
+            messagebox.showerror("Auth Error", f"An error occurred during Spotify authentication: {e}")
+            self.update_spotify_status("Authentication failed.", "red")
+
+    def update_spotify_status(self, text, color):
+        if hasattr(self, 'spotify_status_label'):
+            self.spotify_status_label.configure(text=f"Status: {text}", text_color=color)
+
+    def start_spotify_display(self):
+        stop_all_activity()
+        if not sp:
+            messagebox.showerror("Error", "Spotify is not authenticated. Please authenticate first.")
+            return
+        if not pixoo:
+            messagebox.showerror("Error", "Not connected to Pixoo.")
+            return
+            
+        logging.info("Starting Spotify display task.")
+        spotify_active.set()
+        threading.Thread(target=spotify_task, daemon=True).start()
 
     def start_ai_image_generation(self):
         stop_all_activity()
@@ -1665,27 +1927,26 @@ class App(customtkinter.CTk):
 
     def create_image_stream_frame(self):
         frame = customtkinter.CTkFrame(self, fg_color="transparent")
-        frame.grid_columnconfigure(0, weight=1)
-        frame.grid_columnconfigure(1, weight=2)
-        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1); frame.grid_columnconfigure(1, weight=2); frame.grid_rowconfigure(0, weight=1)
 
+    # --- Left Column Setup ---
         left_col = customtkinter.CTkFrame(frame)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+        left_col.grid_columnconfigure(0, weight=1) # Make column inside left_col expand
 
         ip_frame = customtkinter.CTkFrame(left_col)
-        ip_frame.pack(fill="x", expand=False, padx=10, pady=10)
+        ip_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         ip_frame.grid_columnconfigure(1, weight=1)
         customtkinter.CTkLabel(ip_frame, text="Pixoo IP:", font=self.label_font).grid(row=0, column=0, padx=(10,5), pady=10)
-        self.ip_entry = customtkinter.CTkEntry(ip_frame, placeholder_text="e.g. 192.168.1.100")
+        self.ip_entry = customtkinter.CTkEntry(ip_frame, placeholder_text="e.g. 192.168.1.239")
         self.ip_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=10)
         self.ip_entry.insert(0, DEFAULT_PIXOO_IP)
         self.connect_button = customtkinter.CTkButton(ip_frame, text="Connect", width=80, command=self.on_connect_button_click)
         self.connect_button.grid(row=0, column=2, padx=(5,10), pady=10)
 
         media_frame = customtkinter.CTkFrame(left_col)
-        media_frame.pack(fill="x", expand=False, padx=10, pady=(0, 10))
+        media_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
         customtkinter.CTkButton(media_frame, text="Browse Image", command=self.browse_image).pack(fill="x", padx=10, pady=(10,5))
-
         self.gif_path_label = customtkinter.CTkLabel(media_frame, text="No GIF loaded.")
         self.gif_path_label.pack(fill="x", padx=10, pady=5)
         gif_btn_frame = customtkinter.CTkFrame(media_frame, fg_color="transparent")
@@ -1693,9 +1954,9 @@ class App(customtkinter.CTk):
         gif_btn_frame.grid_columnconfigure((0,1), weight=1)
         customtkinter.CTkButton(gif_btn_frame, text="Browse GIF", command=self.browse_gif).grid(row=0, column=0, sticky="ew", padx=(0,5))
         customtkinter.CTkButton(gif_btn_frame, text="Start GIF", command=self.start_gif).grid(row=0, column=1, sticky="ew", padx=(5,0))
-
+    
         stream_frame = customtkinter.CTkFrame(left_col)
-        stream_frame.pack(fill="x", expand=False, padx=10, pady=(0, 10))
+        stream_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
         customtkinter.CTkButton(stream_frame, text="Start Fullscreen Stream", command=self.start_streaming).pack(fill="x", padx=10, pady=10)
         self.use_region_var = customtkinter.BooleanVar(value=False)
         customtkinter.CTkCheckBox(stream_frame, text="Use Region:", variable=self.use_region_var).pack(anchor="w", padx=10, pady=(0,5))
@@ -1708,32 +1969,25 @@ class App(customtkinter.CTk):
         self.region_h_entry = customtkinter.CTkEntry(region_frame, placeholder_text="H"); self.region_h_entry.insert(0, "600"); self.region_h_entry.grid(row=0, column=3, sticky="ew", padx=(5,0))
 
         options_frame = customtkinter.CTkFrame(left_col)
-        options_frame.pack(fill="x", expand=False, padx=10, pady=(0, 10))
+        options_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
         customtkinter.CTkLabel(options_frame, text="Processing Options", font=self.large_font).pack(anchor="w", padx=10, pady=10)
         self.resize_mode_var = customtkinter.StringVar(value="BICUBIC")
         self.filter_mode_var = customtkinter.StringVar(value="NONE")
-        self.crop_to_square_mode = customtkinter.BooleanVar(value=False)
+        self.crop_to_square_mode = customtkinter.BooleanVar(value=True)
         customtkinter.CTkLabel(options_frame, text="Resizing:").pack(anchor="w", padx=10)
-        self.resize_mode_combobox = customtkinter.CTkComboBox(options_frame, variable=self.resize_mode_var, values=[r.name for r in Image.Resampling if r.name != 'DEFAULT'])
-        self.resize_mode_combobox.pack(fill="x", padx=10, pady=(0,10))
+        self.resize_mode_combobox = customtkinter.CTkComboBox(options_frame, variable=self.resize_mode_var, values=[r.name for r in Image.Resampling if r.name != 'DEFAULT']); self.resize_mode_combobox.pack(fill="x", padx=10, pady=(0,10))
         customtkinter.CTkLabel(options_frame, text="Filter:").pack(anchor="w", padx=10)
-        self.filter_combobox = customtkinter.CTkComboBox(options_frame, variable=self.filter_mode_var, values=list(filter_options.keys()))
-        self.filter_combobox.pack(fill="x", padx=10, pady=(0,10))
-        self.crop_checkbutton = customtkinter.CTkCheckBox(options_frame, text="Crop to 1:1 Square", variable=self.crop_to_square_mode, command=refresh_preview)
-        self.crop_checkbutton.pack(anchor="w", padx=10, pady=10)
+        self.filter_combobox = customtkinter.CTkComboBox(options_frame, variable=self.filter_mode_var, values=list(filter_options.keys())); self.filter_combobox.pack(fill="x", padx=10, pady=(0,10))
+        self.crop_checkbutton = customtkinter.CTkCheckBox(options_frame, text="Crop to 1:1 Square", variable=self.crop_to_square_mode, command=refresh_preview); self.crop_checkbutton.pack(anchor="w", padx=10, pady=10)
 
-        right_col = customtkinter.CTkFrame(frame)
-        right_col.grid(row=0, column=1, sticky="nsew")
-        right_col.grid_rowconfigure(0, weight=1)
-        right_col.grid_columnconfigure(0, weight=1)
+        left_col.grid_rowconfigure(4, weight=1)
 
-        self.preview_label = customtkinter.CTkLabel(right_col, text="")
-        self.preview_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        blank_image = customtkinter.CTkImage(light_image=Image.new('RGB', (384, 384), (240, 240, 240)),
-                                             dark_image=Image.new('RGB', (384, 384), (20, 20, 20)),
-                                             size=(384, 384))
+    # --- Right Column ---
+        right_col = customtkinter.CTkFrame(frame); right_col.grid(row=0, column=1, sticky="nsew")
+        right_col.grid_rowconfigure(0, weight=1); right_col.grid_columnconfigure(0, weight=1)
+        self.preview_label = customtkinter.CTkLabel(right_col, text=""); self.preview_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        blank_image = customtkinter.CTkImage(light_image=Image.new('RGB', (384, 384), (20, 20, 20)), dark_image=Image.new('RGB', (384, 384), (20, 20, 20)), size=(384, 384))
         self.preview_label.configure(image=blank_image)
-
         return frame
 
     def create_video_frame(self):
@@ -1848,12 +2102,11 @@ class App(customtkinter.CTk):
 
     def create_designer_frame(self):
         frame = customtkinter.CTkFrame(self, fg_color="transparent")
-        frame.grid_columnconfigure(1, weight=1)
-        frame.grid_rowconfigure(0, weight=1)
-
+        frame.grid_columnconfigure(1, weight=1); frame.grid_rowconfigure(0, weight=1)
+        
         left_col = customtkinter.CTkFrame(frame, width=200)
         left_col.grid(row=0, column=0, sticky="nsw", padx=(0, 20))
-
+        
         tools_frame = customtkinter.CTkFrame(left_col)
         tools_frame.pack(fill="x", padx=10, pady=10)
         customtkinter.CTkLabel(tools_frame, text="Tools").pack()
@@ -1861,13 +2114,13 @@ class App(customtkinter.CTk):
         self.tool_eraser_btn = customtkinter.CTkButton(tools_frame, text="Eraser", command=lambda: self.set_active_tool("eraser"), fg_color="transparent"); self.tool_eraser_btn.pack(fill="x", pady=2)
         self.tool_fill_btn = customtkinter.CTkButton(tools_frame, text="Fill Bucket", command=lambda: self.set_active_tool("fill"), fg_color="transparent"); self.tool_fill_btn.pack(fill="x", pady=2)
         self.tool_eyedropper_btn = customtkinter.CTkButton(tools_frame, text="Eyedropper", command=lambda: self.set_active_tool("eyedropper"), fg_color="transparent"); self.tool_eyedropper_btn.pack(fill="x", pady=2)
-
+        
         color_frame = customtkinter.CTkFrame(left_col)
         color_frame.pack(fill="x", padx=10, pady=10)
         customtkinter.CTkLabel(color_frame, text="Color").pack()
         self.color_preview_label = customtkinter.CTkLabel(color_frame, text="", fg_color=current_draw_color, height=30, corner_radius=5); self.color_preview_label.pack(fill="x", pady=5)
         customtkinter.CTkButton(color_frame, text="Choose Color", command=self.choose_drawing_color).pack(fill="x")
-
+        
         actions_frame = customtkinter.CTkFrame(left_col)
         actions_frame.pack(fill="x", padx=10, pady=10)
         self.is_live_push_enabled = customtkinter.BooleanVar(value=False)
@@ -1876,12 +2129,12 @@ class App(customtkinter.CTk):
         customtkinter.CTkButton(actions_frame, text="Clear Frame", command=self.clear_designer_canvas).pack(fill="x", pady=5)
         customtkinter.CTkButton(actions_frame, text="Load Image to Frame", command=self.browse_and_load_image).pack(fill="x", pady=5)
         customtkinter.CTkButton(actions_frame, text="Save Frame as PNG", command=self.save_canvas_image).pack(fill="x", pady=5)
-
+        
         mid_col = customtkinter.CTkFrame(frame, fg_color="transparent")
         mid_col.grid(row=0, column=1, sticky="nsew")
         mid_col.grid_rowconfigure(0, weight=1)
         mid_col.grid_columnconfigure(0, weight=1)
-
+        
         canvas_container = customtkinter.CTkFrame(mid_col)
         canvas_container.pack(expand=True, anchor="center")
         self.designer_canvas = customtkinter.CTkCanvas(canvas_container, width=512, height=512, bg='#000000', highlightthickness=0)
@@ -1889,36 +2142,38 @@ class App(customtkinter.CTk):
         self.designer_canvas.bind("<Button-1>", self.handle_canvas_click)
         self.designer_canvas.bind("<B1-Motion>", self.handle_canvas_drag)
         self.designer_canvas.bind("<ButtonRelease-1>", self.handle_canvas_release)
-
+        
         anim_ui_frame = customtkinter.CTkFrame(mid_col)
         anim_ui_frame.pack(fill="x", pady=(20,0))
         anim_ui_frame.grid_columnconfigure(0, weight=3)
         anim_ui_frame.grid_columnconfigure(1, weight=1)
-
+        
         self.designer_frame_listbox = customtkinter.CTkScrollableFrame(anim_ui_frame, label_text="Animation Frames", height=120, orientation="horizontal")
         self.designer_frame_listbox.grid(row=0, column=0, sticky="ew", padx=(0,10))
-
+        
         anim_controls = customtkinter.CTkFrame(anim_ui_frame)
         anim_controls.grid(row=0, column=1, sticky="ns")
-
+        
         btn_frame = customtkinter.CTkFrame(anim_controls, fg_color="transparent")
         btn_frame.pack(fill="x", pady=5)
         customtkinter.CTkButton(btn_frame, text="Add", command=self.add_animation_frame).pack(side="left", expand=True, fill="x", padx=2)
         customtkinter.CTkButton(btn_frame, text="Dupe", command=self.duplicate_animation_frame).pack(side="left", expand=True, fill="x", padx=2)
         customtkinter.CTkButton(btn_frame, text="Del", command=self.remove_animation_frame).pack(side="left", expand=True, fill="x", padx=2)
-
+        
         self.onion_skin_enabled = customtkinter.BooleanVar(value=True)
         customtkinter.CTkCheckBox(anim_controls, text="Onion Skin", variable=self.onion_skin_enabled, command=self.toggle_onion_skin).pack(anchor="w", padx=5)
-
+        
         play_frame = customtkinter.CTkFrame(anim_controls, fg_color="transparent")
         play_frame.pack(fill="x", pady=5)
         play_frame.grid_columnconfigure(2, weight=1)
         customtkinter.CTkLabel(play_frame, text="FPS:").grid(row=0, column=0)
-        self.anim_fps_entry = customtkinter.CTkEntry(play_frame, width=50); self.anim_fps_entry.insert(0,"10"); self.anim_fps_entry.grid(row=0, column=1, padx=5)
+        self.anim_fps_entry = customtkinter.CTkEntry(play_frame, width=50)
+        self.anim_fps_entry.insert(0,"10")
+        self.anim_fps_entry.grid(row=0, column=1, padx=5)
         customtkinter.CTkButton(play_frame, text="Play", command=self.start_pixel_animation).grid(row=0, column=2, sticky="ew")
-
+        
         customtkinter.CTkButton(anim_controls, text="Export as GIF", command=self.export_animation_as_gif).pack(fill="x", padx=5, pady=(0,5))
-
+        
         return frame
 
     def create_webcam_frame(self):
@@ -2050,6 +2305,38 @@ class App(customtkinter.CTk):
 
         return frame
 
+    def create_spotify_frame(self):
+        frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        frame.grid_columnconfigure(0, weight=1)
+
+        customtkinter.CTkLabel(frame, text="Spotify 'Now Playing'", font=self.large_font).pack(anchor="center", pady=(0,20))
+
+        auth_frame = customtkinter.CTkFrame(frame)
+        auth_frame.pack(fill="x", pady=10)
+        customtkinter.CTkLabel(auth_frame, text="Spotify Client ID:").pack(anchor="w", padx=10, pady=(10,0))
+        self.spotify_client_id_entry = customtkinter.CTkEntry(auth_frame, placeholder_text="Enter your Client ID from Spotify Developer Dashboard")
+        self.spotify_client_id_entry.insert(0, DEFAULT_SPOTIFY_CLIENT_ID)
+        self.spotify_client_id_entry.pack(fill="x", padx=10, pady=(0,10))
+        customtkinter.CTkLabel(auth_frame, text="Spotify Client Secret:").pack(anchor="w", padx=10, pady=(10,0))
+        self.spotify_client_secret_entry = customtkinter.CTkEntry(auth_frame, placeholder_text="Enter your Client Secret from Spotify Developer Dashboard", show="*")
+        self.spotify_client_secret_entry.insert(0, DEFAULT_SPOTIFY_CLIENT_SECRET)
+        self.spotify_client_secret_entry.pack(fill="x", padx=10, pady=(0,10))
+        
+        customtkinter.CTkLabel(auth_frame, text="Make sure to add 'http://127.0.0.1:8888/callback' as a Redirect URI in your Spotify App settings.", font=self.label_font, text_color="grey").pack(padx=10)
+
+        customtkinter.CTkButton(auth_frame, text="Authenticate with Spotify", command=self.handle_spotify_auth).pack(fill="x", padx=10, pady=10)
+        self.spotify_status_label = customtkinter.CTkLabel(auth_frame, text="Status: Not Authenticated", text_color="orange")
+        self.spotify_status_label.pack(padx=10, pady=(0,10))
+        
+        options_frame = customtkinter.CTkFrame(frame)
+        options_frame.pack(fill="x", pady=10)
+        self.spotify_show_lyrics_var = customtkinter.BooleanVar(value=True)
+        customtkinter.CTkCheckBox(options_frame, text="[ALPHA] Show Synced Lyrics (via lrclib.net, if available)", variable=self.spotify_show_lyrics_var).pack(anchor="w", padx=10, pady=10)
+
+        customtkinter.CTkButton(frame, text="START SPOTIFY DISPLAY", command=self.start_spotify_display, height=40).pack(fill="x", pady=20, ipady=10)
+        
+        return frame
+
     def create_ai_frame(self):
         frame = customtkinter.CTkFrame(self, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=1)
@@ -2095,7 +2382,7 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
         customtkinter.CTkLabel(center_frame, text="by Doug Farmer", font=author_font).pack()
-        customtkinter.CTkLabel(center_frame, text="Version 2.5", font=author_font).pack(pady=(0, 10))
+        customtkinter.CTkLabel(center_frame, text="Version 2.6", font=author_font).pack(pady=(0, 10))
 
         customtkinter.CTkLabel(center_frame, text="Special Thanks", font=header_font).pack(pady=(20, 5))
         customtkinter.CTkLabel(center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech.\nThis tool was built and expanded upon his great work.", font=body_font, justify="center").pack()
@@ -2107,6 +2394,7 @@ class App(customtkinter.CTk):
 
     def on_closing(self):
         stop_all_activity()
+        save_config(app_config)
         if NVIDIA_GPU_SUPPORT:
             pynvml.nvmlShutdown()
         self.destroy()

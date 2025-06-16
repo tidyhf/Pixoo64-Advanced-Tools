@@ -8,3 +8,4 @@ opencv-python
 feedparser
 requests
 customtkinter
+spotipy
