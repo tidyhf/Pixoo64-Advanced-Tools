@@ -22,6 +22,10 @@ import time
 import threading
 import json
 import os
+
+# This MUST be set before cv2 is imported to prevent console spam
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
 import random
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser
@@ -80,7 +84,6 @@ playlist_files = []
 rss_feed_urls = []
 current_gif_path = None
 current_video_path = None
-processed_gif_frames = [] 
 text_color = (255, 255, 255)
 outline_color = (0, 0, 0)
 font_path = None
@@ -121,7 +124,7 @@ DEFAULT_PIXOO_IP = app_config.get('ip_address', '')
 # --- Core Functions ---
 
 def stop_all_activity():
-    if gif_active.is_set() or text_active.is_set(): 
+    if gif_active.is_set() or text_active.is_set():
         toggle_processing_controls(enabled=True)
     if webcam_active.is_set():
         webcam_capture_button.config(state="disabled")
@@ -193,7 +196,7 @@ def refresh_preview():
         update_preview_label(processed_image)
 
 #
-# Background Tasks (run in separate threads)
+# Background Tasks
 #
 
 def screen_capture_task():
@@ -224,11 +227,11 @@ def advanced_sysmon_task(options):
         
         stats = {}
         if options["cpu_total"] or options["cpu_cores"]:
-             stats["cpu_total"] = psutil.cpu_percent(interval=1)
-             if options["cpu_cores"]:
-                 stats["cpu_cores"] = psutil.cpu_percent(interval=None, percpu=True)
+                stats["cpu_total"] = psutil.cpu_percent(interval=1)
+                if options["cpu_cores"]:
+                        stats["cpu_cores"] = psutil.cpu_percent(interval=None, percpu=True)
         else:
-             time.sleep(1) 
+                time.sleep(1) 
 
         if options["ram"]: stats["ram"] = psutil.virtual_memory().percent
         
@@ -290,37 +293,91 @@ def draw_sysmon_dashboard(img, stats, font):
         y_offset += 10
         draw.text((2, y_offset), f"DN: {down_text}", font=font, fill="white")
 
-def play_gif_for_duration(gif_path, duration_s):
-    MIN_FRAME_DURATION_S = 0.02
+def play_video_for_duration(video_path, duration_s):
     start_time = time.monotonic()
     
     try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logging.error(f"Could not open video file in playlist: {video_path}")
+            playlist_active.wait(2)
+            return
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_delay = 1.0 / fps if fps > 0 else 1.0 / 30.0
+        next_frame_time = time.monotonic()
+        
         while time.monotonic() - start_time < duration_s:
             if not playlist_active.is_set(): break
+
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                next_frame_time = time.monotonic()
+                continue
+
+            # Frame Skipping Logic
+            if time.monotonic() > next_frame_time:
+                next_frame_time += frame_delay
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
             
-            with Image.open(gif_path) as gif:
-                for frame_image in ImageSequence.Iterator(gif):
+            processed = process_image(pil_image)
+            if pixoo:
+                pixoo.draw_image(processed); pixoo.push()
+            update_preview_label(processed)
+            
+            next_frame_time += frame_delay
+            sleep_duration = next_frame_time - time.monotonic()
+            if sleep_duration > 0:
+                time.sleep(sleep_duration)
+
+        cap.release()
+    except Exception as e:
+        logging.error(f"Error during playlist video playback '{video_path}': {e}")
+        playlist_active.wait(2)
+
+def play_gif_for_duration(gif_path, duration_s):
+    start_time = time.monotonic()
+    
+    try:
+        with Image.open(gif_path) as gif:
+            frames = []
+            for frame_image in ImageSequence.Iterator(gif):
+                frame_duration = frame_image.info.get('duration', 100) / 1000.0
+                converted_frame = frame_image.convert("RGB")
+                processed_frame = process_image(converted_frame)
+                frames.append({'image': processed_frame, 'duration': frame_duration})
+
+            if not frames:
+                logging.warning(f"Could not load frames for GIF: {gif_path}")
+                return
+                
+            MIN_FRAME_DELAY_S = 0.02
+            next_frame_time = time.monotonic()
+            
+            while time.monotonic() - start_time < duration_s:
+                if not playlist_active.is_set(): break
+                
+                for frame_data in frames:
                     if not playlist_active.is_set() or time.monotonic() - start_time >= duration_s:
                         break
 
-                    frame_start_time = time.monotonic()
-                    if pixoo is None: 
-                        playlist_active.wait(1)
-                        continue
+                    wait_time = next_frame_time - time.monotonic()
+                    if wait_time > 0: time.sleep(wait_time)
 
-                    frame_rgb = frame_image.convert("RGB")
-                    processed = process_image(frame_rgb)
-                    pixoo.draw_image(processed); pixoo.push()
-                    update_preview_label(processed)
+                    if pixoo is None: 
+                        playlist_active.wait(0.5)
+                        continue
                     
-                    frame_duration = frame_image.info.get('duration', 100) / 1000.0
-                    if frame_duration < MIN_FRAME_DURATION_S:
-                        frame_duration = MIN_FRAME_DURATION_S
-                        
-                    elapsed_s = time.monotonic() - frame_start_time
-                    time_to_wait = frame_duration - elapsed_s
-                    if time_to_wait > 0:
-                        playlist_active.wait(time_to_wait)
+                    frame_to_show = frame_data['image']
+                    pixoo.draw_image(frame_to_show); pixoo.push()
+                    update_preview_label(frame_to_show)
+                    
+                    next_frame_time += max(frame_data['duration'], MIN_FRAME_DELAY_S)
+
     except Exception as e:
         logging.error(f"Could not play playlist GIF '{gif_path}': {e}")
         playlist_active.wait(2)
@@ -339,9 +396,14 @@ def playlist_task(interval_s, shuffle):
         for item_path in playlist_copy:
             if not playlist_active.is_set(): break
             
-            if item_path.lower().endswith('.gif'):
+            file_ext = os.path.splitext(item_path)[1].lower()
+            
+            if file_ext == '.gif':
                 logging.info(f"Playing GIF from playlist: {item_path} for {interval_s}s")
                 play_gif_for_duration(item_path, interval_s)
+            elif file_ext in ['.mp4', '.mkv', '.avi', '.mov']:
+                logging.info(f"Playing video from playlist: {item_path} for {interval_s}s")
+                play_video_for_duration(item_path, interval_s)
             else:
                 logging.info(f"Displaying image from playlist: {item_path} for {interval_s}s")
                 try:
@@ -349,12 +411,13 @@ def playlist_task(interval_s, shuffle):
                     processed = process_image(image)
                     pixoo.draw_image(processed); pixoo.push()
                     update_preview_label(processed)
-                    for _ in range(interval_s):
+                    # Wait for the interval duration, checking the event frequently
+                    for _ in range(interval_s * 4): # Check 4 times a second
                         if not playlist_active.is_set(): break 
-                        time.sleep(1)
+                        time.sleep(0.25)
                 except Exception as e:
                     logging.error(f"Error cycling image '{item_path}': {e}")
-                    time.sleep(2)
+                    playlist_active.wait(2)
         
         if not playlist_active.is_set(): break
 
@@ -364,67 +427,97 @@ def playlist_task(interval_s, shuffle):
 
     logging.info("Playlist cycle finished.")
 
+def standalone_gif_task():
+    toggle_processing_controls(enabled=False)
+    gif_path_label.config(text="Processing, please wait...")
 
-def preprocess_gif_task():
-    global processed_gif_frames; processed_gif_frames.clear()
-    if not current_gif_path: return
     try:
         with Image.open(current_gif_path) as gif:
-            for i, frame_image in enumerate(ImageSequence.Iterator(gif)):
-                gif_path_label.config(text=f"Processing frame {i+1}...")
-                frame_rgb = frame_image.convert("RGB"); processed = process_image(frame_rgb)
-                duration = frame_image.info.get('duration', 100)
-                processed_gif_frames.append({'image': processed, 'duration': duration})
-        gif_path_label.config(text=f"Ready: {current_gif_path.split('/')[-1]}")
-        gif_active.set(); threading.Thread(target=gif_playback_task, daemon=True).start()
-    except Exception as e:
-        messagebox.showerror("GIF Error", f"Could not process GIF: {e}")
-        gif_path_label.config(text="GIF processing failed."); toggle_processing_controls(enabled=True)
+            frames = []
+            for frame_image in ImageSequence.Iterator(gif):
+                frame_duration = frame_image.info.get('duration', 100) / 1000.0
+                converted_frame = frame_image.convert("RGB")
+                processed_frame = process_image(converted_frame)
+                frames.append({'image': processed_frame, 'duration': frame_duration})
+        
+        if not frames:
+            messagebox.showerror("GIF Error", "Could not load any frames from the GIF.")
+            gif_path_label.config(text="GIF processing failed.")
+            toggle_processing_controls(enabled=True)
+            gif_active.clear()
+            return
 
-def gif_playback_task():
-    if not processed_gif_frames: return
-    MIN_FRAME_DURATION_S = 0.02
-    while gif_active.is_set():
-        for frame_data in processed_gif_frames:
-            start_time = time.monotonic()
-            if not gif_active.is_set(): break
-            if pixoo is None: time.sleep(1); continue
-            try:
-                frame_image = frame_data['image']; pixoo.draw_image(frame_image); pixoo.push()
+        gif_path_label.config(text=f"Playing: {os.path.basename(current_gif_path)}")
+        
+        MIN_FRAME_DELAY_S = 0.02
+        next_frame_time = time.monotonic()
+        
+        while gif_active.is_set():
+            for frame_data in frames:
+                if not gif_active.is_set(): break
+                if pixoo is None: 
+                    gif_active.wait(0.5)
+                    continue
+
+                wait_time = next_frame_time - time.monotonic()
+                if wait_time > 0: time.sleep(wait_time)
+                
+                frame_image = frame_data['image']
+                pixoo.draw_image(frame_image); pixoo.push()
                 update_preview_label(frame_image)
-                duration_s = frame_data['duration'] / 1000.0
-                if duration_s < MIN_FRAME_DURATION_S: duration_s = MIN_FRAME_DURATION_S
-                elapsed_s = time.monotonic() - start_time
-                time_to_wait = duration_s - elapsed_s
-                if time_to_wait > 0: gif_active.wait(time_to_wait)
-            except Exception as e:
-                logging.error(f"Error during GIF playback: {e}"); gif_active.clear(); break
-        if not gif_active.is_set(): break
-    logging.info("GIF playback finished."); toggle_processing_controls(enabled=True)
+
+                next_frame_time += max(frame_data['duration'], MIN_FRAME_DELAY_S)
+            
+            if not gif_active.is_set(): break
+
+    except Exception as e:
+        messagebox.showerror("GIF Error", f"Could not process or play GIF: {e}")
+    finally:
+        gif_path_label.config(text=f"Selected: {os.path.basename(current_gif_path)}")
+        toggle_processing_controls(enabled=True)
+        gif_active.clear()
+        logging.info("GIF playback finished.")
 
 def video_playback_task():
     if not current_video_path: return
     
     try:
-        cap = cv2.VideoCapture(current_video_path)
+        cap = cv2.VideoCapture(current_video_path) 
         if not cap.isOpened():
             messagebox.showerror("Video Error", "Could not open video file.")
             video_active.clear()
             return
             
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_delay = 1.0 / fps if fps > 0 else 1.0 / 30.0
+        next_frame_time = time.monotonic()
+        
         while video_active.is_set() and cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                next_frame_time = time.monotonic()
+                continue
+            
+            # Frame Skipping Logic
+            if time.monotonic() > next_frame_time:
+                next_frame_time += frame_delay
                 continue
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
             
             processed = process_image(pil_image)
-            pixoo.draw_image(processed); pixoo.push()
+            if pixoo:
+                pixoo.draw_image(processed)
+                pixoo.push()
             update_preview_label(processed)
-        
+            
+            next_frame_time += frame_delay
+            sleep_duration = next_frame_time - time.monotonic()
+            if sleep_duration > 0:
+                time.sleep(sleep_duration)
+
         cap.release()
     except Exception as e:
         logging.error(f"Error during video playback: {e}")
@@ -542,7 +635,7 @@ def rss_task(delay_between_headlines, scroll_speed_ms):
         
         logging.info("Finished RSS feed cycle.")
         if rss_active.is_set():
-             rss_active.wait(60)
+                rss_active.wait(60)
 
     logging.info("RSS Feed task stopped.")
 
@@ -773,7 +866,7 @@ def browse_image():
 def browse_gif():
     global current_gif_path; stop_all_activity(); path = filedialog.askopenfilename(filetypes=[("GIFs", "*.gif")])
     if not path: return
-    current_gif_path = path; gif_path_label.config(text=f"Selected: {path.split('/')[-1]}")
+    current_gif_path = path; gif_path_label.config(text=f"Selected: {os.path.basename(path)}")
     try:
         with Image.open(path) as gif: 
             preview_frame = gif.convert("RGB")
@@ -809,10 +902,11 @@ def start_video():
     threading.Thread(target=video_playback_task, daemon=True).start()
 
 def start_gif():
-    stop_all_activity();
+    stop_all_activity()
     if not current_gif_path: messagebox.showerror("Error", "No GIF file loaded."); return
-    toggle_processing_controls(enabled=False); gif_path_label.config(text="Processing GIF...")
-    threading.Thread(target=preprocess_gif_task, daemon=True).start()
+    gif_active.set()
+    # This now calls the new unified task directly
+    threading.Thread(target=standalone_gif_task, daemon=True).start()
 
 def start_playlist():
     stop_all_activity();
@@ -827,9 +921,18 @@ def start_playlist():
     threading.Thread(target=playlist_task, args=(interval_value, shuffle), daemon=True).start()
 
 def add_to_playlist():
-    files = filedialog.askopenfilenames(filetypes=[("All Media", "*.png;*.jpg;*.jpeg;*.bmp;*.gif"), ("Image Files", "*.png;*.jpg;*.jpeg;*.bmp"), ("GIF Files", "*.gif")])
+    # Updated to accept all supported media types in one go
+    files = filedialog.askopenfilenames(
+        title="Add Media to Playlist",
+        filetypes=[
+            ("All Supported Media", "*.png *.jpg *.jpeg *.bmp *.gif *.mp4 *.mkv *.avi *.mov"),
+            ("Image Files", "*.png *.jpg *.jpeg *.bmp"), 
+            ("Animated GIFs", "*.gif"),
+            ("Video Files", "*.mp4 *.mkv *.avi *.mov")
+        ]
+    )
     for f in files:
-        if f not in playlist_files: playlist_files.append(f); playlist_listbox.insert(tk.END, f.split('/')[-1])
+        if f not in playlist_files: playlist_files.append(f); playlist_listbox.insert(tk.END, os.path.basename(f))
 
 def remove_from_playlist():
     indices = sorted(playlist_listbox.curselection(), reverse=True)
@@ -855,7 +958,7 @@ def load_playlist():
         with open(path, 'r') as f:
             for line in f:
                 file_path = line.strip()
-                if file_path: playlist_files.append(file_path); playlist_listbox.insert(tk.END, file_path.split('/')[-1])
+                if file_path: playlist_files.append(file_path); playlist_listbox.insert(tk.END, os.path.basename(file_path))
     except Exception as e: messagebox.showerror("Error", f"Could not load playlist: {e}")
 
 def update_text_preview(event=None):
@@ -1020,13 +1123,13 @@ def discover_webcams_task():
     webcam_refresh_button.config(text="Scanning...", state="disabled")
     
     available_cams = []
-    # Suppress stderr from OpenCV during webcam probing
-    with open(os.devnull, 'w') as f, contextlib.redirect_stderr(f):
-        for i in range(10):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                available_cams.append(f"Camera {i}")
-                cap.release()
+    # Using CAP_DSHOW is good practice on Windows. The os.environ call at the
+    # top of the script now handles the error message suppression.
+    for i in range(10):
+        cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            available_cams.append(f"Camera {i}")
+            cap.release()
             
     if not available_cams:
         webcam_device_combobox['values'] = ["No webcams found"]
@@ -1260,7 +1363,7 @@ credits_center_frame = ttk.Frame(tab4); credits_center_frame.pack(expand=True)
 title_font = ("Segoe UI", 18, "bold"); author_font = ("Segoe UI", 12, "italic"); header_font = ("Segoe UI", 11, "bold"); body_font = ("Segoe UI", 10); link_font = ("Segoe UI", 10, "underline")
 ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
 ttk.Label(credits_center_frame, text="by Doug Farmer", font=author_font).pack()
-ttk.Label(credits_center_frame, text="Version 1.5.1", font=author_font).pack(pady=(0, 10))
+ttk.Label(credits_center_frame, text="Version 2.0", font=author_font).pack(pady=(0, 10))
 discord_frame = ttk.Frame(credits_center_frame); discord_frame.pack(pady=5); ttk.Label(discord_frame, text="Discord:", font=body_font).pack(side=tk.LEFT); ttk.Label(discord_frame, text="wtfyd", font=link_font, foreground="#5865F2").pack(side=tk.LEFT)
 ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="Special Thanks", font=header_font).pack()
 ttk.Label(credits_center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech. This tool was built and expanded upon his great work.", font=body_font, wraplength=400, justify="center").pack(pady=5)
