@@ -22,6 +22,7 @@ This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the 
 - **Powerful Text Displayer**: Scroll messages with control over fonts, size, color, outline, and effects.
 - **Live Audio Visualizer**: Choose from effects like *Classic Bars*, *Radial Pulse*, and *Vortex* to visualize your PC's audio.
 - **RSS Feeds**: Pull in live news, updates, or custom info feeds to show on your Pixoo.
+- **AI Image Generation**: Generate AI images within the app for free with zero setup.
 
 ---
 
