@@ -4,7 +4,7 @@
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
 # This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
 # mixed-media playlists, a live system performance monitor, a powerful custom text displayer,
-# a live audio visualizer, an RSS feed reader, and a live webcam viewer.
+# a live audio visualizer, an RSS feed reader, a live webcam viewer, and a live pixel art designer.
 #
 # Main libraries used:
 # - tkinter: For the GUI components.
@@ -75,7 +75,8 @@ rss_active = threading.Event()
 ai_image_active = threading.Event()
 webcam_active = threading.Event()
 webcam_slideshow_active = threading.Event()
-ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active]
+pixel_animation_active = threading.Event()
+ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active, pixel_animation_active]
 
 show_grid = True
 resize_method = Image.Resampling.BICUBIC
@@ -92,6 +93,16 @@ vortex_angle = 0
 vortex_particles = []
 current_webcam_frame = None
 captured_frames = []
+
+# State variables for the Pixel Designer
+designer_canvas = None
+current_designer_image = None
+current_draw_color = "#FF0000"
+active_tool = "pencil"
+animation_frames = []
+current_frame_index = -1
+is_live_push_enabled = None
+onion_skin_enabled = None
 
 
 filter_options = {
@@ -229,7 +240,7 @@ def advanced_sysmon_task(options):
         if options["cpu_total"] or options["cpu_cores"]:
                 stats["cpu_total"] = psutil.cpu_percent(interval=1)
                 if options["cpu_cores"]:
-                        stats["cpu_cores"] = psutil.cpu_percent(interval=None, percpu=True)
+                            stats["cpu_cores"] = psutil.cpu_percent(interval=None, percpu=True)
         else:
                 time.sleep(1) 
 
@@ -317,22 +328,22 @@ def play_video_for_duration(video_path, duration_s):
                 continue
 
             # Frame Skipping Logic
-            if time.monotonic() > next_frame_time:
+            if time.monotonic() < next_frame_time:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+                
+                processed = process_image(pil_image)
+                if pixoo:
+                    pixoo.draw_image(processed); pixoo.push()
+                update_preview_label(processed)
+                
                 next_frame_time += frame_delay
-                continue
+                sleep_duration = next_frame_time - time.monotonic()
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+            else:
+                 next_frame_time += frame_delay
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(frame_rgb)
-            
-            processed = process_image(pil_image)
-            if pixoo:
-                pixoo.draw_image(processed); pixoo.push()
-            update_preview_label(processed)
-            
-            next_frame_time += frame_delay
-            sleep_duration = next_frame_time - time.monotonic()
-            if sleep_duration > 0:
-                time.sleep(sleep_duration)
 
         cap.release()
     except Exception as e:
@@ -500,23 +511,23 @@ def video_playback_task():
                 continue
             
             # Frame Skipping Logic
-            if time.monotonic() > next_frame_time:
+            if time.monotonic() < next_frame_time:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(frame_rgb)
+                
+                processed = process_image(pil_image)
+                if pixoo:
+                    pixoo.draw_image(processed)
+                    pixoo.push()
+                update_preview_label(processed)
+                
                 next_frame_time += frame_delay
-                continue
+                sleep_duration = next_frame_time - time.monotonic()
+                if sleep_duration > 0:
+                    time.sleep(sleep_duration)
+            else:
+                next_frame_time += frame_delay
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(frame_rgb)
-            
-            processed = process_image(pil_image)
-            if pixoo:
-                pixoo.draw_image(processed)
-                pixoo.push()
-            update_preview_label(processed)
-            
-            next_frame_time += frame_delay
-            sleep_duration = next_frame_time - time.monotonic()
-            if sleep_duration > 0:
-                time.sleep(sleep_duration)
 
         cap.release()
     except Exception as e:
@@ -806,7 +817,6 @@ def webcam_slideshow_task(interval_s, shuffle):
                 pixoo.push()
             update_preview_label(processed)
             
-            # Use the same robust timing logic as the image playlist
             for _ in range(interval_s):
                 if not webcam_slideshow_active.is_set(): break 
                 time.sleep(1)
@@ -814,6 +824,35 @@ def webcam_slideshow_task(interval_s, shuffle):
         if not webcam_slideshow_active.is_set(): break
     
     logging.info("Webcam slideshow finished.")
+
+def pixel_animation_task(delay_s):
+    """
+    Cycles through the animation frames and displays them on the Pixoo.
+    """
+    if not animation_frames:
+        logging.warning("Animation started with no frames.")
+        return
+
+    while pixel_animation_active.is_set():
+        for frame_image in animation_frames:
+            if not pixel_animation_active.is_set():
+                break
+            if pixoo:
+                try:
+                    pixoo.draw_image(frame_image)
+                    pixoo.push()
+                    update_preview_label(frame_image)
+                    root.after(0, load_image_to_canvas_data, frame_image)
+                except Exception as e:
+                    logging.error(f"Error during pixel animation: {e}")
+                    pixel_animation_active.clear()
+                    break
+            
+            for _ in range(int(delay_s * 10)):
+                if not pixel_animation_active.is_set(): break
+                time.sleep(0.1)
+                
+    logging.info("Pixel animation task stopped.")
 
 
 #
@@ -905,7 +944,6 @@ def start_gif():
     stop_all_activity()
     if not current_gif_path: messagebox.showerror("Error", "No GIF file loaded."); return
     gif_active.set()
-    # This now calls the new unified task directly
     threading.Thread(target=standalone_gif_task, daemon=True).start()
 
 def start_playlist():
@@ -921,7 +959,6 @@ def start_playlist():
     threading.Thread(target=playlist_task, args=(interval_value, shuffle), daemon=True).start()
 
 def add_to_playlist():
-    # Updated to accept all supported media types in one go
     files = filedialog.askopenfilenames(
         title="Add Media to Playlist",
         filetypes=[
@@ -1123,8 +1160,6 @@ def discover_webcams_task():
     webcam_refresh_button.config(text="Scanning...", state="disabled")
     
     available_cams = []
-    # Using CAP_DSHOW is good practice on Windows. The os.environ call at the
-    # top of the script now handles the error message suppression.
     for i in range(10):
         cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
         if cap.isOpened():
@@ -1276,6 +1311,244 @@ def start_webcam_slideshow():
     webcam_slideshow_active.set()
     threading.Thread(target=webcam_slideshow_task, args=(interval, shuffle), daemon=True).start()
 
+# --- Pixel Designer Functions ---
+def init_designer_canvas():
+    global designer_canvas, current_designer_image, current_frame_index, animation_frames
+    animation_frames.clear()
+    designer_frame_listbox.delete(0, tk.END)
+    current_frame_index = -1
+    current_designer_image = Image.new('RGB', (64, 64), 'black')
+    animation_frames.append(current_designer_image)
+    current_frame_index = 0
+    designer_frame_listbox.insert(tk.END, "Frame 1")
+    designer_frame_listbox.selection_set(0)
+    draw_pixel_grid()
+    load_image_to_canvas_data(current_designer_image)
+
+def draw_pixel_grid():
+    if not designer_canvas: return
+    designer_canvas.delete("grid")
+    for i in range(0, 513, 8):
+        designer_canvas.create_line(i, 0, i, 512, tag="grid", fill="#333333")
+        designer_canvas.create_line(0, i, 512, i, tag="grid", fill="#333333")
+
+def set_active_tool(tool_name):
+    global active_tool
+    active_tool = tool_name
+    logging.info(f"Tool changed to: {tool_name}")
+
+def choose_drawing_color():
+    global current_draw_color
+    color_code = colorchooser.askcolor(title="Choose Draw Color", initialcolor=current_draw_color)
+    if color_code and color_code[1]:
+        current_draw_color = color_code[1]
+        color_preview_label.config(bg=current_draw_color)
+
+def handle_canvas_click(event):
+    global current_draw_color
+    x, y = event.x // 8, event.y // 8
+    if not (0 <= x < 64 and 0 <= y < 64): return
+
+    if active_tool == "pencil": update_pixel_on_canvas(x, y, current_draw_color)
+    elif active_tool == "eraser": update_pixel_on_canvas(x, y, "#000000")
+    elif active_tool == "fill": flood_fill(x, y, current_draw_color)
+    elif active_tool == "eyedropper":
+        r, g, b = current_designer_image.getpixel((x, y))
+        color_hex = f'#{r:02x}{g:02x}{b:02x}'
+        current_draw_color = color_hex
+        color_preview_label.config(bg=current_draw_color)
+        set_active_tool("pencil")
+
+def handle_canvas_drag(event):
+    x, y = event.x // 8, event.y // 8
+    if not (0 <= x < 64 and 0 <= y < 64): return
+    if active_tool == "pencil": update_pixel_on_canvas(x, y, current_draw_color)
+    elif active_tool == "eraser": update_pixel_on_canvas(x, y, "#000000")
+
+def handle_canvas_release(event):
+    """Handles mouse button release to push updates and refresh the preview."""
+    update_preview_label(current_designer_image)
+    if is_live_push_enabled.get() and pixoo:
+        push_canvas_to_pixoo()
+
+def update_pixel_on_canvas(x, y, color):
+    """Updates a single pixel on the canvas and in the data model."""
+    if not current_designer_image: return
+    rgb_color = Image.new("RGB", (1, 1), color).getpixel((0, 0))
+    current_designer_image.putpixel((x, y), rgb_color)
+    pixel_id = f"p_{x}_{y}"
+    designer_canvas.delete(pixel_id)
+    if color != "#000000":
+        designer_canvas.create_rectangle(x*8, y*8, (x+1)*8, (y+1)*8, fill=color, outline="", tags=pixel_id)
+
+def flood_fill(start_x, start_y, new_color_hex):
+    """Fills an area with the selected color using a queue-based algorithm."""
+    if not current_designer_image: return
+    new_color_rgb = Image.new("RGB", (1, 1), new_color_hex).getpixel((0, 0))
+    target_color_rgb = current_designer_image.getpixel((start_x, start_y))
+    if target_color_rgb == new_color_rgb: return
+    queue = [(start_x, start_y)]
+    while queue:
+        x, y = queue.pop(0)
+        if not (0 <= x < 64 and 0 <= y < 64): continue
+        if current_designer_image.getpixel((x, y)) == target_color_rgb:
+            current_designer_image.putpixel((x, y), new_color_rgb)
+            queue.extend([(x+1, y), (x-1, y), (x, y+1), (x, y-1)])
+            
+    load_image_to_canvas_data(current_designer_image)
+    update_preview_label(current_designer_image)
+    if is_live_push_enabled.get():
+        push_canvas_to_pixoo()
+
+def push_canvas_to_pixoo():
+    if pixoo is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
+    if current_designer_image is None: return
+    try:
+        pixoo.draw_image(current_designer_image)
+        pixoo.push()
+        logging.info("Pushed pixel design to Pixoo.")
+    except Exception as e: messagebox.showerror("Error", f"Failed to push to Pixoo: {e}")
+
+def clear_designer_canvas():
+    if current_designer_image:
+        draw = ImageDraw.Draw(current_designer_image)
+        draw.rectangle([0, 0, 64, 64], fill='black')
+        load_image_to_canvas_data(current_designer_image)
+        handle_canvas_release(None)
+
+def load_image_to_canvas_data(image_to_load):
+    designer_canvas.delete("all")
+    draw_pixel_grid()
+    if onion_skin_enabled.get() and current_frame_index > 0:
+        prev_frame_image = animation_frames[current_frame_index - 1]
+        for y in range(64):
+            for x in range(64):
+                r,g,b = prev_frame_image.getpixel((x,y))
+                if (r,g,b) != (0,0,0):
+                    onion_color = f'#{r//4:02x}{g//4:02x}{b//4:02x}'
+                    designer_canvas.create_rectangle(x*8, y*8, (x+1)*8, (y+1)*8, fill=onion_color, outline="")
+    for y in range(64):
+        for x in range(64):
+            r, g, b = image_to_load.getpixel((x, y))
+            if (r, g, b) != (0, 0, 0):
+                color = f'#{r:02x}{g:02x}{b:02x}'
+                designer_canvas.create_rectangle(x*8, y*8, (x+1)*8, (y+1)*8, fill=color, outline="", tags=f"p_{x}_{y}")
+
+def browse_and_load_image():
+    path = filedialog.askopenfilename(filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.bmp;*.gif")])
+    if not path: return
+    try:
+        img = Image.open(path).convert("RGB").resize((64, 64), Image.Resampling.NEAREST)
+        global current_designer_image
+        current_designer_image = img
+        animation_frames[current_frame_index] = current_designer_image
+        load_image_to_canvas_data(img)
+        handle_canvas_release(None)
+    except Exception as e: messagebox.showerror("Error", f"Failed to load image: {e}")
+
+def save_canvas_image():
+    if not current_designer_image: return
+    path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG files", "*.png")], title="Save Current Frame As")
+    if not path: return
+    try:
+        current_designer_image.save(path, "PNG")
+        messagebox.showinfo("Success", f"Frame saved successfully to:\n{path}")
+    except Exception as e: messagebox.showerror("Save Error", f"Failed to save image: {e}")
+
+def add_animation_frame():
+    global current_frame_index, current_designer_image
+    new_frame = Image.new('RGB', (64, 64), 'black')
+    animation_frames.append(new_frame)
+    current_frame_index = len(animation_frames) - 1
+    current_designer_image = new_frame
+    designer_frame_listbox.insert(tk.END, f"Frame {len(animation_frames)}")
+    designer_frame_listbox.selection_clear(0, tk.END)
+    designer_frame_listbox.selection_set(current_frame_index)
+    load_image_to_canvas_data(current_designer_image)
+
+def duplicate_animation_frame():
+    selection = designer_frame_listbox.curselection()
+    if not selection: messagebox.showwarning("No selection", "Please select a frame to duplicate."); return
+    global current_frame_index, current_designer_image
+    source_index = selection[0]
+    frame_to_copy = animation_frames[source_index].copy()
+    animation_frames.insert(source_index + 1, frame_to_copy)
+    # Rebuild listbox to reflect new order and names
+    designer_frame_listbox.delete(0, tk.END)
+    for i, _ in enumerate(animation_frames):
+        designer_frame_listbox.insert(tk.END, f"Frame {i+1}")
+    
+    current_frame_index = source_index + 1
+    current_designer_image = frame_to_copy
+    designer_frame_listbox.selection_clear(0, tk.END)
+    designer_frame_listbox.selection_set(current_frame_index)
+    load_image_to_canvas_data(current_designer_image)
+
+def remove_animation_frame():
+    if len(animation_frames) <= 1: messagebox.showwarning("Cannot Remove", "Cannot remove the last frame."); return
+    selection = designer_frame_listbox.curselection()
+    if not selection: messagebox.showwarning("No selection", "Please select a frame to remove."); return
+    index_to_remove = selection[0]
+    animation_frames.pop(index_to_remove)
+    # Rebuild listbox
+    designer_frame_listbox.delete(0, tk.END)
+    for i, _ in enumerate(animation_frames):
+        designer_frame_listbox.insert(tk.END, f"Frame {i+1}")
+        
+    new_selection_index = max(0, index_to_remove - 1)
+    on_frame_select(new_selection_index, is_direct_index=True)
+
+
+def on_frame_select(event_or_index, is_direct_index=False):
+    if is_direct_index:
+        selection_index = event_or_index
+    else:
+        selection = designer_frame_listbox.curselection()
+        if not selection: return
+        selection_index = selection[0]
+
+    global current_frame_index, current_designer_image
+    if selection_index == current_frame_index: return
+    current_frame_index = selection_index
+    current_designer_image = animation_frames[current_frame_index]
+    
+    # Update selection in listbox if called directly
+    if is_direct_index:
+        designer_frame_listbox.selection_clear(0, tk.END)
+        designer_frame_listbox.selection_set(selection_index)
+
+    load_image_to_canvas_data(current_designer_image)
+
+
+def toggle_onion_skin():
+    if current_designer_image: load_image_to_canvas_data(current_designer_image)
+
+def start_pixel_animation():
+    stop_all_activity()
+    if not animation_frames: messagebox.showerror("Error", "No frames to animate."); return
+    try: delay = 1.0 / float(anim_fps_spinbox.get())
+    except ValueError: delay = 1.0 / 10.0
+    pixel_animation_active.set()
+    threading.Thread(target=pixel_animation_task, args=(delay,), daemon=True).start()
+
+def export_animation_as_gif():
+    if len(animation_frames) < 2: messagebox.showwarning("Not an animation", "You need at least 2 frames to export a GIF."); return
+    path = filedialog.asksaveasfilename(defaultextension=".gif", filetypes=[("GIF files", "*.gif")], title="Save Animation As GIF")
+    if not path: return
+    try:
+        duration_ms = int(1000 / float(anim_fps_spinbox.get()))
+        animation_frames[0].save(path, save_all=True, append_images=animation_frames[1:], duration=duration_ms, loop=0)
+        messagebox.showinfo("Success", f"Animation saved as GIF to:\n{path}")
+    except Exception as e: messagebox.showerror("Export Error", f"Failed to save GIF: {e}")
+
+def on_tab_changed(event):
+    try:
+        selected_tab_text = notebook.tab(notebook.select(), "text")
+        if selected_tab_text == "Pixel Designer" and not animation_frames:
+            init_designer_canvas()
+    except tk.TclError:
+        pass # Can happen if tabs are not fully initialized yet
+
 #
 # GUI Setup
 #
@@ -1288,12 +1561,14 @@ ttk.Label(ip_frame, text="Pixoo IP:").pack(side=tk.LEFT); ip_entry = ttk.Entry(i
 connect_button = ttk.Button(ip_frame, text="Connect", command=on_connect_button_click); connect_button.pack(side=tk.LEFT)
 
 notebook = ttk.Notebook(main_frame); notebook.pack(fill="both", expand=True, pady=5)
+notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
 
 # Create all tab frames
 tab1 = ttk.Frame(notebook, padding=10)
 tab7 = ttk.Frame(notebook, padding=10)
 tab2 = ttk.Frame(notebook, padding=10)
 tab5 = ttk.Frame(notebook, padding=10)
+tab_designer = ttk.Frame(notebook, padding=10)
 tab10 = ttk.Frame(notebook, padding=10) 
 tab6 = ttk.Frame(notebook, padding=10)
 tab3 = ttk.Frame(notebook, padding=10)
@@ -1306,6 +1581,7 @@ notebook.add(tab1, text='Image & Stream')
 notebook.add(tab7, text='Video Player')
 notebook.add(tab2, text='Playlist')
 notebook.add(tab5, text='Text Display')
+notebook.add(tab_designer, text='Pixel Designer')
 notebook.add(tab10, text='Webcam')
 notebook.add(tab6, text='Equalizer')
 notebook.add(tab3, text='System Monitor')
@@ -1332,6 +1608,17 @@ options_frame = ttk.LabelFrame(t1_left, text="Processing Options", padding=5); o
 resize_mode_var = tk.StringVar(value="BICUBIC"); filter_mode_var = tk.StringVar(value="NONE"); crop_to_square_mode = tk.BooleanVar(value=False); ttk.Label(options_frame, text="Resizing:").pack(anchor="w"); resize_mode_combobox = ttk.Combobox(options_frame, textvariable=resize_mode_var, values=[r.name for r in Image.Resampling if r.name != 'DEFAULT'], state="readonly"); resize_mode_combobox.pack(fill="x")
 ttk.Label(options_frame, text="Filter:").pack(anchor="w", pady=(5,0)); filter_combobox = ttk.Combobox(options_frame, textvariable=filter_mode_var, values=list(filter_options.keys()), state="readonly"); filter_combobox.pack(fill="x"); crop_checkbutton = ttk.Checkbutton(options_frame, text="Crop to 1:1 Square", variable=crop_to_square_mode, command=refresh_preview); crop_checkbutton.pack(anchor="w", pady=5)
 
+# Tab 7: Video Player
+video_browse_frame = ttk.LabelFrame(tab7, text="Video File", padding=10)
+video_browse_frame.pack(fill="x")
+video_path_label = ttk.Label(video_browse_frame, text="No video selected.")
+video_path_label.pack(fill="x", pady=5)
+ttk.Button(video_browse_frame, text="Browse for Video File", command=browse_video).pack(fill="x")
+video_controls_frame = ttk.Frame(tab7, padding=10)
+video_controls_frame.pack(fill="x", pady=10)
+ttk.Button(video_controls_frame, text="PLAY VIDEO", command=start_video, style="Accent.TButton").pack(fill="x", ipady=10)
+ttk.Label(tab7, text="Supports most common video formats (mp4, mkv, avi, mov).\nVideo will loop automatically.", justify="center").pack(pady=10)
+
 # Tab 2: Playlist
 t2_left = ttk.Frame(tab2); t2_left.pack(side=tk.LEFT, fill="both", expand=True, padx=(0,10)); t2_right = ttk.Frame(tab2); t2_right.pack(side=tk.RIGHT, fill="y")
 listbox_frame = ttk.Frame(t2_left); listbox_frame.pack(fill="both", expand=True); playlist_scrollbar = ttk.Scrollbar(listbox_frame, orient=tk.VERTICAL); playlist_listbox = tk.Listbox(listbox_frame, yscrollcommand=playlist_scrollbar.set, selectmode=tk.EXTENDED); playlist_scrollbar.config(command=playlist_listbox.yview); playlist_scrollbar.pack(side=tk.RIGHT, fill=tk.Y); playlist_listbox.pack(side=tk.LEFT, fill="both", expand=True)
@@ -1340,34 +1627,6 @@ ttk.Separator(t2_right).pack(fill="x", pady=10); ttk.Button(t2_right, text="Save
 ttk.Label(t2_right, text="Interval (s):").pack(); interval_spinbox = tk.Spinbox(t2_right, from_=1, to=3600, width=10, justify=tk.CENTER); interval_spinbox.pack(fill="x", pady=2); interval_spinbox.delete(0, "end"); interval_spinbox.insert(0, "10")
 shuffle_playlist_var = tk.BooleanVar(value=False); ttk.Checkbutton(t2_right, text="Shuffle Playlist", variable=shuffle_playlist_var).pack(pady=5)
 ttk.Button(t2_right, text="START PLAYLIST", command=start_playlist, style="Accent.TButton").pack(fill="x", pady=(10,2)); style.configure("Accent.TButton", foreground="green")
-
-# Tab 3: System Monitor
-sm_options_frame = ttk.LabelFrame(tab3, text="Metrics to Display (Dashboard Style)", padding=10)
-sm_options_frame.pack(fill="x")
-cpu_total_var = tk.BooleanVar(value=True)
-ram_var = tk.BooleanVar(value=True)
-gpu_var = tk.BooleanVar(value=NVIDIA_GPU_SUPPORT)
-network_var = tk.BooleanVar(value=False)
-cpu_cores_var = tk.BooleanVar(value=False)
-ttk.Checkbutton(sm_options_frame, text="CPU (Total %)", variable=cpu_total_var).pack(anchor="w")
-ttk.Checkbutton(sm_options_frame, text="RAM (%)", variable=ram_var).pack(anchor="w")
-gpu_cb = ttk.Checkbutton(sm_options_frame, text="GPU (NVIDIA)", variable=gpu_var)
-gpu_cb.pack(anchor="w")
-if not NVIDIA_GPU_SUPPORT:
-    gpu_cb.config(state="disabled")
-ttk.Checkbutton(sm_options_frame, text="Network (KB/s)", variable=network_var).pack(anchor="w")
-ttk.Button(tab3, text="START MONITOR", command=start_advanced_sysmon, style="Accent.TButton").pack(pady=20, ipady=10)
-
-# Tab 4: Credits
-credits_center_frame = ttk.Frame(tab4); credits_center_frame.pack(expand=True)
-title_font = ("Segoe UI", 18, "bold"); author_font = ("Segoe UI", 12, "italic"); header_font = ("Segoe UI", 11, "bold"); body_font = ("Segoe UI", 10); link_font = ("Segoe UI", 10, "underline")
-ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
-ttk.Label(credits_center_frame, text="by Doug Farmer", font=author_font).pack()
-ttk.Label(credits_center_frame, text="Version 2.0", font=author_font).pack(pady=(0, 10))
-discord_frame = ttk.Frame(credits_center_frame); discord_frame.pack(pady=5); ttk.Label(discord_frame, text="Discord:", font=body_font).pack(side=tk.LEFT); ttk.Label(discord_frame, text="wtfyd", font=link_font, foreground="#5865F2").pack(side=tk.LEFT)
-ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="Special Thanks", font=header_font).pack()
-ttk.Label(credits_center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech. This tool was built and expanded upon his great work.", font=body_font, wraplength=400, justify="center").pack(pady=5)
-ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="https://github.com/tidyhf/Pixoo64-Advanced-Tools", font=author_font).pack(pady=10)
 
 # Tab 5: Text Display
 t5_left = ttk.Frame(tab5); t5_left.pack(side=tk.LEFT, fill="both", expand=True, padx=(0,10)); t5_right = ttk.Frame(tab5); t5_right.pack(side=tk.LEFT, fill="y")
@@ -1388,6 +1647,112 @@ anim_speed_frame = ttk.Frame(anim_frame); anim_speed_frame.pack(fill='x', pady=(
 ttk.Label(anim_speed_frame, text="Scroll Speed (ms):").pack(side='left'); anim_speed_spinbox = tk.Spinbox(anim_speed_frame, from_=10, to=1000, increment=10, width=6); anim_speed_spinbox.pack(side='left', padx=5); anim_speed_spinbox.delete(0,"end"); anim_speed_spinbox.insert(0,"50")
 ttk.Button(t5_right, text="DISPLAY TEXT", command=display_text, style="Accent.TButton").pack(fill="x", ipady=5, pady=10)
 
+# Tab: Pixel Designer
+designer_main_frame = ttk.Frame(tab_designer)
+designer_main_frame.pack(fill="both", expand=True)
+designer_top_frame = ttk.Frame(designer_main_frame)
+designer_top_frame.pack(side=tk.TOP, fill="both", expand=True)
+designer_left_frame = ttk.Frame(designer_top_frame, width=200)
+designer_left_frame.pack(side=tk.LEFT, fill="y", padx=(0, 10))
+designer_left_frame.pack_propagate(False)
+designer_right_frame = ttk.Frame(designer_top_frame)
+designer_right_frame.pack(side=tk.LEFT, fill="both", expand=True)
+designer_canvas = tk.Canvas(designer_right_frame, width=512, height=512, bg='black', highlightthickness=0)
+designer_canvas.pack(anchor="n", pady=10)
+designer_canvas.bind("<Button-1>", handle_canvas_click)
+designer_canvas.bind("<B1-Motion>", handle_canvas_drag)
+designer_canvas.bind("<ButtonRelease-1>", handle_canvas_release)
+tools_frame = ttk.LabelFrame(designer_left_frame, text="Tools", padding=5)
+tools_frame.pack(fill="x", pady=5)
+ttk.Button(tools_frame, text="Pencil", command=lambda: set_active_tool("pencil")).pack(fill="x")
+ttk.Button(tools_frame, text="Eraser", command=lambda: set_active_tool("eraser")).pack(fill="x", pady=2)
+ttk.Button(tools_frame, text="Fill Bucket", command=lambda: set_active_tool("fill")).pack(fill="x")
+ttk.Button(tools_frame, text="Eyedropper", command=lambda: set_active_tool("eyedropper")).pack(fill="x", pady=2)
+color_frame = ttk.LabelFrame(designer_left_frame, text="Color", padding=5)
+color_frame.pack(fill="x", pady=5)
+color_preview_label = tk.Label(color_frame, text=" ", bg=current_draw_color, relief="sunken", height=2)
+color_preview_label.pack(fill="x", pady=(0,5))
+ttk.Button(color_frame, text="Choose Color", command=choose_drawing_color).pack(fill="x")
+actions_frame = ttk.LabelFrame(designer_left_frame, text="Canvas Actions", padding=5)
+actions_frame.pack(fill="x", pady=5)
+is_live_push_enabled = tk.BooleanVar(value=False)
+ttk.Checkbutton(actions_frame, text="Live Push to Pixoo", variable=is_live_push_enabled).pack(anchor="w")
+ttk.Button(actions_frame, text="Push Manually", command=push_canvas_to_pixoo).pack(fill="x", pady=2)
+ttk.Button(actions_frame, text="Clear Frame", command=clear_designer_canvas).pack(fill="x")
+ttk.Separator(actions_frame).pack(fill="x", pady=5)
+ttk.Button(actions_frame, text="Load Image to Frame", command=browse_and_load_image).pack(fill="x")
+ttk.Button(actions_frame, text="Save Frame as PNG", command=save_canvas_image).pack(fill="x", pady=2)
+anim_frame_ui = ttk.LabelFrame(designer_main_frame, text="Animation Frames", padding=5)
+anim_frame_ui.pack(side=tk.BOTTOM, fill="x", pady=(10, 0))
+anim_list_frame = ttk.Frame(anim_frame_ui)
+anim_list_frame.pack(fill="both", expand=True)
+anim_scrollbar = ttk.Scrollbar(anim_list_frame, orient=tk.VERTICAL)
+designer_frame_listbox = tk.Listbox(anim_list_frame, yscrollcommand=anim_scrollbar.set, exportselection=False, height=5)
+anim_scrollbar.config(command=designer_frame_listbox.yview)
+anim_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+designer_frame_listbox.pack(side=tk.LEFT, fill="both", expand=True, padx=(0,5))
+designer_frame_listbox.bind("<<ListboxSelect>>", on_frame_select)
+anim_controls_frame = ttk.Frame(anim_frame_ui)
+anim_controls_frame.pack(side=tk.LEFT, fill="y", padx=5)
+anim_btn_frame = ttk.Frame(anim_controls_frame)
+anim_btn_frame.pack(fill="x", pady=5)
+ttk.Button(anim_btn_frame, text="Add", command=add_animation_frame).pack(side="left", expand=True, fill="x")
+ttk.Button(anim_btn_frame, text="Dupe", command=duplicate_animation_frame).pack(side="left", expand=True, fill="x", padx=2)
+ttk.Button(anim_btn_frame, text="Del", command=remove_animation_frame).pack(side="left", expand=True, fill="x")
+anim_opts_frame = ttk.Frame(anim_controls_frame)
+anim_opts_frame.pack(fill="x", pady=5)
+onion_skin_enabled = tk.BooleanVar(value=False)
+ttk.Checkbutton(anim_opts_frame, text="Onion Skin", variable=onion_skin_enabled, command=toggle_onion_skin).pack(anchor="w")
+anim_play_frame = ttk.Frame(anim_controls_frame)
+anim_play_frame.pack(fill="x", pady=5)
+ttk.Label(anim_play_frame, text="FPS:").pack(side="left")
+anim_fps_spinbox = tk.Spinbox(anim_play_frame, from_=1, to=60, width=4, justify=tk.CENTER)
+anim_fps_spinbox.pack(side="left", padx=(0,5))
+anim_fps_spinbox.delete(0, "end"); anim_fps_spinbox.insert(0, "10")
+ttk.Button(anim_play_frame, text="Play", command=start_pixel_animation).pack(side="left", expand=True, fill="x")
+ttk.Button(anim_controls_frame, text="Export as GIF", command=export_animation_as_gif).pack(fill="x", pady=(5,0))
+
+# Tab 10: Webcam
+webcam_main_frame = ttk.Frame(tab10, padding=5)
+webcam_main_frame.pack(fill="both", expand=True)
+webcam_left_frame = ttk.Frame(webcam_main_frame); webcam_left_frame.pack(side=tk.LEFT, fill="y", padx=(0, 10))
+webcam_right_frame = ttk.Frame(webcam_main_frame); webcam_right_frame.pack(side=tk.LEFT, fill="both", expand=True)
+device_frame = ttk.LabelFrame(webcam_left_frame, text="Live Controls", padding=5)
+device_frame.pack(fill="x")
+webcam_device_combobox = ttk.Combobox(device_frame, state="readonly", width=30)
+webcam_device_combobox.pack(pady=5)
+webcam_device_combobox.set("No webcams found")
+webcam_refresh_button = ttk.Button(device_frame, text="Find Webcams", command=start_webcam_discovery)
+webcam_refresh_button.pack(fill="x", pady=5)
+ttk.Button(device_frame, text="START WEBCAM", command=start_webcam, style="Accent.TButton").pack(fill="x", ipady=5, pady=5)
+webcam_capture_button = ttk.Button(device_frame, text="Capture Frame", command=capture_webcam_frame, state="disabled")
+webcam_capture_button.pack(fill="x", pady=5)
+capture_frame = ttk.LabelFrame(webcam_right_frame, text="Captured Frames", padding=5)
+capture_frame.pack(fill="both", expand=True)
+webcam_listbox_frame = ttk.Frame(capture_frame)
+webcam_listbox_frame.pack(fill="both", expand=True, pady=5)
+webcam_scrollbar = ttk.Scrollbar(webcam_listbox_frame, orient=tk.VERTICAL)
+webcam_listbox = tk.Listbox(webcam_listbox_frame, yscrollcommand=webcam_scrollbar.set)
+webcam_scrollbar.config(command=webcam_listbox.yview)
+webcam_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+webcam_listbox.pack(side=tk.LEFT, fill="both", expand=True)
+frame_mgmt_frame = ttk.Frame(capture_frame)
+frame_mgmt_frame.pack(fill="x", pady=(5,0))
+ttk.Button(frame_mgmt_frame, text="Import", command=import_captured_frames).pack(side="left", fill="x", expand=True)
+ttk.Button(frame_mgmt_frame, text="Export All", command=export_captured_frames).pack(side="left", fill="x", expand=True, padx=5)
+ttk.Button(frame_mgmt_frame, text="Remove", command=remove_captured_frame).pack(side="left", fill="x", expand=True)
+slideshow_frame = ttk.LabelFrame(capture_frame, text="Slideshow", padding=5)
+slideshow_frame.pack(fill="x", pady=10)
+ttk.Button(slideshow_frame, text="Display Selected", command=display_captured_frame).pack(side="left", fill="x", expand=True)
+ttk.Separator(slideshow_frame, orient="vertical").pack(side="left", fill="y", padx=10, pady=5)
+ttk.Label(slideshow_frame, text="Interval (s):").pack(side="left")
+webcam_interval_spinbox = tk.Spinbox(slideshow_frame, from_=1, to=3600, width=5, justify=tk.CENTER)
+webcam_interval_spinbox.pack(side="left", padx=5)
+webcam_interval_spinbox.delete(0, "end"); webcam_interval_spinbox.insert(0, "5")
+webcam_shuffle_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(slideshow_frame, text="Shuffle", variable=webcam_shuffle_var).pack(side="left", padx=5)
+ttk.Button(slideshow_frame, text="Start Slideshow", command=start_webcam_slideshow).pack(side="left", padx=5)
+
 # Tab 6: Equalizer
 eq_top_frame = ttk.Frame(tab6, padding=5); eq_top_frame.pack(fill="x")
 ttk.Label(eq_top_frame, text="Audio Device:").pack(side="left", padx=5); device_listbox = ttk.Combobox(eq_top_frame, state="readonly", width=40); device_listbox.pack(side="left", fill="x", expand=True, padx=5)
@@ -1397,16 +1762,22 @@ ttk.Label(eq_bottom_frame, text="Effect:").pack(side="left", padx=5); eq_effect_
 ttk.Button(tab6, text="START VISUALIZER", command=start_equalizer, style="Accent.TButton").pack(pady=20, ipady=10)
 ttk.Label(tab6, text="This visualizer captures audio playing on your PC.\nSelect your main speakers or headphones from the list.", justify="center").pack(pady=10)
 
-# Tab 7: Video Player
-video_browse_frame = ttk.LabelFrame(tab7, text="Video File", padding=10)
-video_browse_frame.pack(fill="x")
-video_path_label = ttk.Label(video_browse_frame, text="No video selected.")
-video_path_label.pack(fill="x", pady=5)
-ttk.Button(video_browse_frame, text="Browse for Video File", command=browse_video).pack(fill="x")
-video_controls_frame = ttk.Frame(tab7, padding=10)
-video_controls_frame.pack(fill="x", pady=10)
-ttk.Button(video_controls_frame, text="PLAY VIDEO", command=start_video, style="Accent.TButton").pack(fill="x", ipady=10)
-ttk.Label(tab7, text="Supports most common video formats (mp4, mkv, avi, mov).\nVideo will loop automatically.", justify="center").pack(pady=10)
+# Tab 3: System Monitor
+sm_options_frame = ttk.LabelFrame(tab3, text="Metrics to Display (Dashboard Style)", padding=10)
+sm_options_frame.pack(fill="x")
+cpu_total_var = tk.BooleanVar(value=True)
+ram_var = tk.BooleanVar(value=True)
+gpu_var = tk.BooleanVar(value=NVIDIA_GPU_SUPPORT)
+network_var = tk.BooleanVar(value=False)
+cpu_cores_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(sm_options_frame, text="CPU (Total %)", variable=cpu_total_var).pack(anchor="w")
+ttk.Checkbutton(sm_options_frame, text="RAM (%)", variable=ram_var).pack(anchor="w")
+gpu_cb = ttk.Checkbutton(sm_options_frame, text="GPU (NVIDIA)", variable=gpu_var)
+gpu_cb.pack(anchor="w")
+if not NVIDIA_GPU_SUPPORT:
+    gpu_cb.config(state="disabled")
+ttk.Checkbutton(sm_options_frame, text="Network (KB/s)", variable=network_var).pack(anchor="w")
+ttk.Button(tab3, text="START MONITOR", command=start_advanced_sysmon, style="Accent.TButton").pack(pady=20, ipady=10)
 
 # Tab 8: RSS Feeds
 rss_main_frame = ttk.Frame(tab8, padding=5)
@@ -1462,53 +1833,17 @@ ttk.Button(ai_btn_frame, text="GENERATE IMAGE", command=start_ai_image_generatio
 ttk.Button(ai_btn_frame, text="Save Last Image", command=save_ai_image).pack(side="left", fill="x", expand=True, padx=(5,0))
 ttk.Label(ai_main_frame, text="Powered by Pollinations.ai", justify="center").pack(pady=5)
 
-# Tab 10: Webcam
-webcam_main_frame = ttk.Frame(tab10, padding=5)
-webcam_main_frame.pack(fill="both", expand=True)
-webcam_left_frame = ttk.Frame(webcam_main_frame); webcam_left_frame.pack(side=tk.LEFT, fill="y", padx=(0, 10))
-webcam_right_frame = ttk.Frame(webcam_main_frame); webcam_right_frame.pack(side=tk.LEFT, fill="both", expand=True)
-# Left side
-device_frame = ttk.LabelFrame(webcam_left_frame, text="Live Controls", padding=5)
-device_frame.pack(fill="x")
-webcam_device_combobox = ttk.Combobox(device_frame, state="readonly", width=30)
-webcam_device_combobox.pack(pady=5)
-webcam_device_combobox.set("No webcams found")
-webcam_refresh_button = ttk.Button(device_frame, text="Find Webcams", command=start_webcam_discovery)
-webcam_refresh_button.pack(fill="x", pady=5)
-ttk.Button(device_frame, text="START WEBCAM", command=start_webcam, style="Accent.TButton").pack(fill="x", ipady=5, pady=5)
-webcam_capture_button = ttk.Button(device_frame, text="Capture Frame", command=capture_webcam_frame, state="disabled")
-webcam_capture_button.pack(fill="x", pady=5)
-# Right side: Captured frames and slideshow
-capture_frame = ttk.LabelFrame(webcam_right_frame, text="Captured Frames", padding=5)
-capture_frame.pack(fill="both", expand=True)
-webcam_listbox_frame = ttk.Frame(capture_frame)
-webcam_listbox_frame.pack(fill="both", expand=True, pady=5)
-webcam_scrollbar = ttk.Scrollbar(webcam_listbox_frame, orient=tk.VERTICAL)
-webcam_listbox = tk.Listbox(webcam_listbox_frame, yscrollcommand=webcam_scrollbar.set)
-webcam_scrollbar.config(command=webcam_listbox.yview)
-webcam_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-webcam_listbox.pack(side=tk.LEFT, fill="both", expand=True)
-# Frame management buttons
-frame_mgmt_frame = ttk.Frame(capture_frame)
-frame_mgmt_frame.pack(fill="x", pady=(5,0))
-ttk.Button(frame_mgmt_frame, text="Import", command=import_captured_frames).pack(side="left", fill="x", expand=True)
-ttk.Button(frame_mgmt_frame, text="Export All", command=export_captured_frames).pack(side="left", fill="x", expand=True, padx=5)
-ttk.Button(frame_mgmt_frame, text="Remove", command=remove_captured_frame).pack(side="left", fill="x", expand=True)
-# Slideshow controls
-slideshow_frame = ttk.LabelFrame(capture_frame, text="Slideshow", padding=5)
-slideshow_frame.pack(fill="x", pady=10)
-ttk.Button(slideshow_frame, text="Display Selected", command=display_captured_frame).pack(side="left", fill="x", expand=True)
-ttk.Separator(slideshow_frame, orient="vertical").pack(side="left", fill="y", padx=10, pady=5)
-ttk.Label(slideshow_frame, text="Interval (s):").pack(side="left")
-webcam_interval_spinbox = tk.Spinbox(slideshow_frame, from_=1, to=3600, width=5, justify=tk.CENTER)
-webcam_interval_spinbox.pack(side="left", padx=5)
-webcam_interval_spinbox.delete(0, "end"); webcam_interval_spinbox.insert(0, "5")
-webcam_shuffle_var = tk.BooleanVar(value=False)
-ttk.Checkbutton(slideshow_frame, text="Shuffle", variable=webcam_shuffle_var).pack(side="left", padx=5)
-ttk.Button(slideshow_frame, text="Start Slideshow", command=start_webcam_slideshow).pack(side="left", padx=5)
+# Tab 4: Credits
+credits_center_frame = ttk.Frame(tab4); credits_center_frame.pack(expand=True)
+title_font = ("Segoe UI", 18, "bold"); author_font = ("Segoe UI", 12, "italic"); header_font = ("Segoe UI", 11, "bold"); body_font = ("Segoe UI", 10); link_font = ("Segoe UI", 10, "underline")
+ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
+ttk.Label(credits_center_frame, text="by Doug Farmer", font=author_font).pack()
+ttk.Label(credits_center_frame, text="Version 2.4", font=author_font).pack(pady=(0, 10))
+discord_frame = ttk.Frame(credits_center_frame); discord_frame.pack(pady=5); ttk.Label(discord_frame, text="Discord:", font=body_font).pack(side=tk.LEFT); ttk.Label(discord_frame, text="wtfyd", font=link_font, foreground="#5865F2").pack(side=tk.LEFT)
+ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="Special Thanks", font=header_font).pack()
+ttk.Label(credits_center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech. This tool was built and expanded upon his great work.", font=body_font, wraplength=400, justify="center").pack(pady=5)
+ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="https://github.com/tidyhf/Pixoo64-Advanced-Tools", font=author_font).pack(pady=10)
 
-
-# This button is always visible at the bottom.
 bottom_frame = ttk.Frame(main_frame); bottom_frame.pack(fill="x", pady=(10,0))
 ttk.Button(bottom_frame, text="STOP ALL ACTIVITY", command=stop_all_activity).pack(fill="x", ipady=5)
 
@@ -1520,7 +1855,6 @@ def on_closing():
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
 
-# Initial population of devices
 populate_audio_devices()
 start_webcam_discovery()
 if DEFAULT_PIXOO_IP:
