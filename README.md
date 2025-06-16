@@ -27,7 +27,7 @@ This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the 
 - **AI Image Generation**: Generate AI images within the app for free with zero setup.
 - **Webcam Streamer**: Stream your webcam live and save frame for easy display, with added shuffle and import/export functions!
 - **Pixel Designer**: Fully featured pixel designer with animation support added!
-- _NEW!_ **Spotify Album Art with Progress Bar and Lyrics added! Work in progress, will improve later.
+- _NEW!_ **Spotify Album Art** Displays the album art, progress bar and Lyrics! Work in progress, will improve later.
 
 ---
 
