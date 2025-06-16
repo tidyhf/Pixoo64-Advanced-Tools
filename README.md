@@ -4,7 +4,7 @@ An advanced Python toolset for customizing and interacting with the Divoom Pixoo
 
 Version 2.4 now live! Overhauled GIF/Video logic for smooth playback.
 
-![hippo](https://i.imgur.com/Yx6ahdH.gif)
+![hippo](https://i.imgur.com/JE5OcNm.gif)
 ---
 
 ## 🚀 Overview
@@ -26,6 +26,7 @@ This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the 
 - **RSS Feeds**: Pull in live news, updates, or custom info feeds to show on your Pixoo.
 - _NEW!_ **AI Image Generation**: Generate AI images within the app for free with zero setup.
 - _NEW!_ **Webcam Streamer**: Stream your webcam live and save frame for easy display, with added shuffle and import/export functions!
+- _NEW!_ **Pixel Designer**: Fully featured pixel designer with animation support added!
 
 ---
 
