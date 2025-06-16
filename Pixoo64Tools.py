@@ -35,6 +35,8 @@ import cv2
 import feedparser
 import requests
 import io
+import sys
+import contextlib
 
 try:
     import pynvml
@@ -881,7 +883,16 @@ def choose_outline_color():
         
 def browse_for_font():
     global font_path; path = filedialog.askopenfilename(filetypes=[("TrueType Fonts", "*.ttf")])
-    if path: font_path = path; font_path_label.config(text=f"Font: {path.split('/')[-1]}"); update_text_preview()
+    if path: 
+        font_path = path
+        font_path_label.config(text=f"Font: {os.path.basename(path)}")
+        update_text_preview()
+
+def reset_to_default_font():
+    global font_path
+    font_path = None
+    font_path_label.config(text="Font: Default")
+    update_text_preview()
 
 def display_text():
     stop_all_activity()
@@ -1009,11 +1020,13 @@ def discover_webcams_task():
     webcam_refresh_button.config(text="Scanning...", state="disabled")
     
     available_cams = []
-    for i in range(10):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            available_cams.append(f"Camera {i}")
-            cap.release()
+    # Suppress stderr from OpenCV during webcam probing
+    with open(os.devnull, 'w') as f, contextlib.redirect_stderr(f):
+        for i in range(10):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                available_cams.append(f"Camera {i}")
+                cap.release()
             
     if not available_cams:
         webcam_device_combobox['values'] = ["No webcams found"]
@@ -1178,7 +1191,7 @@ tab1 = ttk.Frame(notebook, padding=10)
 tab7 = ttk.Frame(notebook, padding=10)
 tab2 = ttk.Frame(notebook, padding=10)
 tab5 = ttk.Frame(notebook, padding=10)
-tab10 = ttk.Frame(notebook, padding=10)
+tab10 = ttk.Frame(notebook, padding=10) 
 tab6 = ttk.Frame(notebook, padding=10)
 tab3 = ttk.Frame(notebook, padding=10)
 tab8 = ttk.Frame(notebook, padding=10)
@@ -1247,7 +1260,7 @@ credits_center_frame = ttk.Frame(tab4); credits_center_frame.pack(expand=True)
 title_font = ("Segoe UI", 18, "bold"); author_font = ("Segoe UI", 12, "italic"); header_font = ("Segoe UI", 11, "bold"); body_font = ("Segoe UI", 10); link_font = ("Segoe UI", 10, "underline")
 ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
 ttk.Label(credits_center_frame, text="by Doug Farmer", font=author_font).pack()
-ttk.Label(credits_center_frame, text="Version 1.5", font=author_font).pack(pady=(0, 10))
+ttk.Label(credits_center_frame, text="Version 1.5.1", font=author_font).pack(pady=(0, 10))
 discord_frame = ttk.Frame(credits_center_frame); discord_frame.pack(pady=5); ttk.Label(discord_frame, text="Discord:", font=body_font).pack(side=tk.LEFT); ttk.Label(discord_frame, text="wtfyd", font=link_font, foreground="#5865F2").pack(side=tk.LEFT)
 ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="Special Thanks", font=header_font).pack()
 ttk.Label(credits_center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech. This tool was built and expanded upon his great work.", font=body_font, wraplength=400, justify="center").pack(pady=5)
@@ -1256,7 +1269,11 @@ ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20,
 # Tab 5: Text Display
 t5_left = ttk.Frame(tab5); t5_left.pack(side=tk.LEFT, fill="both", expand=True, padx=(0,10)); t5_right = ttk.Frame(tab5); t5_right.pack(side=tk.LEFT, fill="y")
 text_entry_frame = ttk.LabelFrame(t5_left, text="Message", padding=5); text_entry_frame.pack(fill="both", expand=True); text_entry = tk.Text(text_entry_frame, height=5, wrap="word"); text_entry.pack(fill="both", expand=True); text_entry.bind("<KeyRelease>", update_text_preview)
-font_frame = ttk.LabelFrame(t5_left, text="Font & Style", padding=5); font_frame.pack(fill="x", pady=5); ttk.Button(font_frame, text="Browse for Font File (.ttf)", command=browse_for_font).pack(fill="x"); font_path_label = ttk.Label(font_frame, text="Font: Default"); font_path_label.pack(anchor="w", pady=2)
+font_frame = ttk.LabelFrame(t5_left, text="Font & Style", padding=5); font_frame.pack(fill="x", pady=5)
+font_buttons_frame = ttk.Frame(font_frame); font_buttons_frame.pack(fill="x")
+ttk.Button(font_buttons_frame, text="Browse for Font File (.ttf)", command=browse_for_font).pack(side="left", fill="x", expand=True)
+ttk.Button(font_buttons_frame, text="Reset to Default", command=reset_to_default_font).pack(side="left", padx=(5,0))
+font_path_label = ttk.Label(font_frame, text="Font: Default"); font_path_label.pack(anchor="w", pady=2)
 style_frame = ttk.Frame(font_frame); style_frame.pack(fill="x", pady=5); ttk.Label(style_frame, text="Size:").pack(side="left"); font_size_spinbox = tk.Spinbox(style_frame, from_=1, to=100, width=4, command=update_text_preview); font_size_spinbox.pack(side="left", padx=(0,10)); font_size_spinbox.delete(0,"end"); font_size_spinbox.insert(0,"16")
 ttk.Label(style_frame, text="X:").pack(side="left"); pos_x_spinbox = tk.Spinbox(style_frame, from_=-64, to=64, width=4, command=update_text_preview); pos_x_spinbox.pack(side="left", padx=(0,10)); pos_x_spinbox.delete(0,"end"); pos_x_spinbox.insert(0,"0")
 ttk.Label(style_frame, text="Y:").pack(side="left"); pos_y_spinbox = tk.Spinbox(style_frame, from_=-64, to=64, width=4, command=update_text_preview); pos_y_spinbox.pack(side="left"); pos_y_spinbox.delete(0,"end"); pos_y_spinbox.insert(0,"0")
@@ -1340,7 +1357,7 @@ ai_btn_frame = ttk.Frame(ai_main_frame)
 ai_btn_frame.pack(fill="x", pady=5)
 ttk.Button(ai_btn_frame, text="GENERATE IMAGE", command=start_ai_image_generation, style="Accent.TButton").pack(side="left", fill="x", expand=True)
 ttk.Button(ai_btn_frame, text="Save Last Image", command=save_ai_image).pack(side="left", fill="x", expand=True, padx=(5,0))
-ttk.Label(ai_main_frame, text="Powered by Pollinations.ai. Generation may take 30-90 seconds.", justify="center").pack(pady=5)
+ttk.Label(ai_main_frame, text="Powered by Pollinations.ai", justify="center").pack(pady=5)
 
 # Tab 10: Webcam
 webcam_main_frame = ttk.Frame(tab10, padding=5)
