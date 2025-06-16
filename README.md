@@ -2,7 +2,7 @@
 
 An advanced Python toolset for customizing and interacting with the Divoom Pixoo 64 display.
 
-Version 2.5 now live!
+Version 2.6 now live!
 
 ![hippo](https://i.imgur.com/LbG1xKj.gif)
 ---
@@ -24,9 +24,10 @@ This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the 
 - **Powerful Text Displayer**: Scroll messages with control over fonts, size, color, outline, and effects.
 - **Live Audio Visualizer**: Choose from effects like *Classic Bars*, *Radial Pulse*, and *Vortex* to visualize your PC's audio.
 - **RSS Feeds**: Pull in live news, updates, or custom info feeds to show on your Pixoo.
-- _NEW!_ **AI Image Generation**: Generate AI images within the app for free with zero setup.
-- _NEW!_ **Webcam Streamer**: Stream your webcam live and save frame for easy display, with added shuffle and import/export functions!
-- _NEW!_ **Pixel Designer**: Fully featured pixel designer with animation support added!
+- **AI Image Generation**: Generate AI images within the app for free with zero setup.
+- **Webcam Streamer**: Stream your webcam live and save frame for easy display, with added shuffle and import/export functions!
+- **Pixel Designer**: Fully featured pixel designer with animation support added!
+- _NEW!_ **Spotify Album Art with Progress Bar and Lyrics added! Work in progress, will improve later.
 
 ---
 
