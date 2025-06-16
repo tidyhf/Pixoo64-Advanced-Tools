@@ -2,7 +2,7 @@
 
 An advanced Python toolset for customizing and interacting with the Divoom Pixoo 64 display.
 
-Version 2.0 now live! Overhauled GIF/Video logic for smooth playback.
+Version 2.4 now live! Overhauled GIF/Video logic for smooth playback.
 
 ![hippo](https://i.imgur.com/Yx6ahdH.gif)
 ---
