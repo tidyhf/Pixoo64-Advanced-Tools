@@ -7,3 +7,4 @@ pynvml
 opencv-python
 feedparser
 requests
+customtkinter
