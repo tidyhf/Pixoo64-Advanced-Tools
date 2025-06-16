@@ -4,7 +4,7 @@
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
 # This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
 # mixed-media playlists, a live system performance monitor, a powerful custom text displayer,
-# a live audio visualizer, and an RSS feed reader.
+# a live audio visualizer, an RSS feed reader, and a live webcam viewer.
 #
 # Main libraries used:
 # - tkinter: For the GUI components.
@@ -13,7 +13,7 @@
 # - psutil: For fetching system CPU, RAM, and Network statistics.
 # - pynvml: For fetching NVIDIA GPU statistics.
 # - numpy & soundcard: For the audio visualizer.
-# - opencv-python: For video file decoding.
+# - opencv-python: For video file decoding and webcam support.
 # - feedparser: For parsing RSS and Atom feeds.
 # - requests: For making API calls to web services.
 #
@@ -22,6 +22,7 @@ import time
 import threading
 import json
 import os
+import random
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, colorchooser
 from PIL import ImageGrab, Image, ImageTk, ImageDraw, ImageFilter, ImageSequence, ImageFont
@@ -66,7 +67,9 @@ equalizer_active = threading.Event()
 video_active = threading.Event()
 rss_active = threading.Event()
 ai_image_active = threading.Event()
-ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active]
+webcam_active = threading.Event()
+webcam_slideshow_active = threading.Event()
+ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active]
 
 show_grid = True
 resize_method = Image.Resampling.BICUBIC
@@ -82,6 +85,9 @@ font_path = None
 
 vortex_angle = 0
 vortex_particles = []
+current_webcam_frame = None
+captured_frames = []
+
 
 filter_options = {
     "NONE": None, "BLUR": ImageFilter.BLUR, "CONTOUR": ImageFilter.CONTOUR,
@@ -115,6 +121,9 @@ DEFAULT_PIXOO_IP = app_config.get('ip_address', '')
 def stop_all_activity():
     if gif_active.is_set() or text_active.is_set(): 
         toggle_processing_controls(enabled=True)
+    if webcam_active.is_set():
+        webcam_capture_button.config(state="disabled")
+
     for event in ALL_EVENTS:
         if event.is_set():
             logging.info(f"Stopping task associated with {event}")
@@ -279,46 +288,80 @@ def draw_sysmon_dashboard(img, stats, font):
         y_offset += 10
         draw.text((2, y_offset), f"DN: {down_text}", font=font, fill="white")
 
-def play_gif_once_in_playlist(gif_path):
+def play_gif_for_duration(gif_path, duration_s):
     MIN_FRAME_DURATION_S = 0.02
+    start_time = time.monotonic()
+    
     try:
-        with Image.open(gif_path) as gif:
-            for frame_image in ImageSequence.Iterator(gif):
-                start_time = time.monotonic()
-                if not playlist_active.is_set(): break
-                if pixoo is None: time.sleep(1); continue
-                frame_rgb = frame_image.convert("RGB"); processed = process_image(frame_rgb)
-                pixoo.draw_image(processed); pixoo.push()
-                update_preview_label(processed)
-                duration_s = frame_image.info.get('duration', 100) / 1000.0
-                if duration_s < MIN_FRAME_DURATION_S: duration_s = MIN_FRAME_DURATION_S
-                elapsed_s = time.monotonic() - start_time
-                time_to_wait = duration_s - elapsed_s
-                if time_to_wait > 0: playlist_active.wait(time_to_wait)
-    except Exception as e:
-        logging.error(f"Could not play playlist GIF '{gif_path}': {e}"); time.sleep(2)
-
-def playlist_task(interval_s):
-    while playlist_active.is_set():
-        if not playlist_files: logging.warning("Playlist is empty, stopping."); break
-        for item_path in playlist_files:
+        while time.monotonic() - start_time < duration_s:
             if not playlist_active.is_set(): break
+            
+            with Image.open(gif_path) as gif:
+                for frame_image in ImageSequence.Iterator(gif):
+                    if not playlist_active.is_set() or time.monotonic() - start_time >= duration_s:
+                        break
+
+                    frame_start_time = time.monotonic()
+                    if pixoo is None: 
+                        playlist_active.wait(1)
+                        continue
+
+                    frame_rgb = frame_image.convert("RGB")
+                    processed = process_image(frame_rgb)
+                    pixoo.draw_image(processed); pixoo.push()
+                    update_preview_label(processed)
+                    
+                    frame_duration = frame_image.info.get('duration', 100) / 1000.0
+                    if frame_duration < MIN_FRAME_DURATION_S:
+                        frame_duration = MIN_FRAME_DURATION_S
+                        
+                    elapsed_s = time.monotonic() - frame_start_time
+                    time_to_wait = frame_duration - elapsed_s
+                    if time_to_wait > 0:
+                        playlist_active.wait(time_to_wait)
+    except Exception as e:
+        logging.error(f"Could not play playlist GIF '{gif_path}': {e}")
+        playlist_active.wait(2)
+
+def playlist_task(interval_s, shuffle):
+    playlist_copy = playlist_files.copy()
+    if shuffle:
+        random.shuffle(playlist_copy)
+        logging.info("Playlist shuffled.")
+
+    while playlist_active.is_set():
+        if not playlist_copy: 
+            logging.warning("Playlist is empty, stopping.")
+            break
+            
+        for item_path in playlist_copy:
+            if not playlist_active.is_set(): break
+            
             if item_path.lower().endswith('.gif'):
-                logging.info(f"Playing GIF from playlist: {item_path}")
-                play_gif_once_in_playlist(item_path)
+                logging.info(f"Playing GIF from playlist: {item_path} for {interval_s}s")
+                play_gif_for_duration(item_path, interval_s)
             else:
                 logging.info(f"Displaying image from playlist: {item_path} for {interval_s}s")
                 try:
-                    image = Image.open(item_path).convert("RGB"); processed = process_image(image)
+                    image = Image.open(item_path).convert("RGB")
+                    processed = process_image(image)
                     pixoo.draw_image(processed); pixoo.push()
                     update_preview_label(processed)
                     for _ in range(interval_s):
                         if not playlist_active.is_set(): break 
                         time.sleep(1)
                 except Exception as e:
-                    logging.error(f"Error cycling image '{item_path}': {e}"); time.sleep(2)
+                    logging.error(f"Error cycling image '{item_path}': {e}")
+                    time.sleep(2)
+        
         if not playlist_active.is_set(): break
+
+        if shuffle:
+            random.shuffle(playlist_copy)
+            logging.info("Playlist re-shuffled for next cycle.")
+
     logging.info("Playlist cycle finished.")
+
 
 def preprocess_gif_task():
     global processed_gif_frames; processed_gif_frames.clear()
@@ -605,27 +648,24 @@ def draw_vortex(data):
     return img
 
 def ai_image_generation_task(prompt, use_pixel_style, use_hd):
-    # This task handles the API call to Pollinations.ai
     ai_image_active.set()
     ai_status_label.config(text="Status: Generating...")
     
     try:
         base_url = "https://image.pollinations.ai/prompt/"
         
-        # Modify the prompt based on user selections
         final_prompt = prompt
         if use_pixel_style:
             final_prompt += ", pixel art, 8-bit, sprite"
         if use_hd:
             final_prompt += ", 4k, ultra detailed"
             
-        # URL encode the prompt to handle special characters
         encoded_prompt = requests.utils.quote(final_prompt)
         
         full_url = f"{base_url}{encoded_prompt}"
         logging.info(f"Requesting AI image from URL: {full_url}")
         
-        response = requests.get(full_url, timeout=90) # 90 second timeout
+        response = requests.get(full_url, timeout=90)
         
         if response.status_code == 200:
             image_data = response.content
@@ -650,6 +690,35 @@ def ai_image_generation_task(prompt, use_pixel_style, use_hd):
         ai_status_label.config(text="Status: Error")
     finally:
         ai_image_active.clear()
+
+
+def webcam_slideshow_task(interval_s, shuffle):
+    while webcam_slideshow_active.is_set():
+        if not captured_frames:
+            logging.info("Webcam slideshow stopped: no frames to display.")
+            break
+
+        frames_to_play = captured_frames.copy()
+        if shuffle:
+            random.shuffle(frames_to_play)
+
+        for frame_image in frames_to_play:
+            if not webcam_slideshow_active.is_set(): break
+
+            processed = process_image(frame_image)
+            if pixoo:
+                pixoo.draw_image(processed)
+                pixoo.push()
+            update_preview_label(processed)
+            
+            # Use the same robust timing logic as the image playlist
+            for _ in range(interval_s):
+                if not webcam_slideshow_active.is_set(): break 
+                time.sleep(1)
+        
+        if not webcam_slideshow_active.is_set(): break
+    
+    logging.info("Webcam slideshow finished.")
 
 
 #
@@ -750,7 +819,10 @@ def start_playlist():
         interval_value = int(interval_spinbox.get());
         if interval_value < 1: interval_value = 5
     except (ValueError, tk.TclError): interval_value = 5
-    playlist_active.set(); threading.Thread(target=playlist_task, args=(interval_value,), daemon=True).start()
+    
+    shuffle = shuffle_playlist_var.get()
+    playlist_active.set()
+    threading.Thread(target=playlist_task, args=(interval_value, shuffle), daemon=True).start()
 
 def add_to_playlist():
     files = filedialog.askopenfilenames(filetypes=[("All Media", "*.png;*.jpg;*.jpeg;*.bmp;*.gif"), ("Image Files", "*.png;*.jpg;*.jpeg;*.bmp"), ("GIF Files", "*.gif")])
@@ -914,6 +986,180 @@ def start_ai_image_generation():
     
     threading.Thread(target=ai_image_generation_task, args=(prompt, use_pixel, use_hd), daemon=True).start()
 
+def save_ai_image():
+    if last_source_image is None:
+        messagebox.showinfo("No Image", "Please generate an image first before saving.")
+        return
+    
+    path = filedialog.asksaveasfilename(
+        defaultextension=".png",
+        filetypes=[("PNG files", "*.png"), ("All files", "*.*")],
+        title="Save AI Image As"
+    )
+    if not path:
+        return
+        
+    try:
+        last_source_image.save(path, "PNG")
+        messagebox.showinfo("Success", f"Image saved successfully to:\n{path}")
+    except Exception as e:
+        messagebox.showerror("Save Error", f"Failed to save image: {e}")
+
+def discover_webcams_task():
+    webcam_refresh_button.config(text="Scanning...", state="disabled")
+    
+    available_cams = []
+    for i in range(10):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            available_cams.append(f"Camera {i}")
+            cap.release()
+            
+    if not available_cams:
+        webcam_device_combobox['values'] = ["No webcams found"]
+        webcam_device_combobox.set("No webcams found")
+    else:
+        webcam_device_combobox['values'] = available_cams
+        webcam_device_combobox.set(available_cams[0])
+        
+    webcam_refresh_button.config(text="Find Webcams", state="normal")
+
+def start_webcam_discovery():
+    threading.Thread(target=discover_webcams_task, daemon=True).start()
+
+def webcam_task(device_index):
+    global current_webcam_frame
+    try:
+        cap = cv2.VideoCapture(device_index)
+        if not cap.isOpened():
+            messagebox.showerror("Webcam Error", f"Could not open Camera {device_index}.")
+            webcam_active.clear()
+            return
+        
+        webcam_capture_button.config(state="normal")
+        
+        while webcam_active.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                logging.warning(f"Could not read frame from Camera {device_index}.")
+                time.sleep(0.1)
+                continue
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            current_webcam_frame = Image.fromarray(frame_rgb)
+            
+            processed = process_image(current_webcam_frame)
+            if pixoo:
+                pixoo.draw_image(processed); pixoo.push()
+            update_preview_label(processed)
+            time.sleep(1/60)
+            
+        cap.release()
+    except Exception as e:
+        logging.error(f"Error during webcam feed: {e}")
+        messagebox.showerror("Webcam Error", f"An error occurred with the webcam feed: {e}")
+    finally:
+        webcam_active.clear()
+        webcam_capture_button.config(state="disabled")
+
+def start_webcam():
+    stop_all_activity()
+    
+    selection = webcam_device_combobox.get()
+    if not selection or "No webcams found" in selection:
+        messagebox.showerror("No Webcam", "No webcam selected or found.")
+        return
+        
+    try:
+        device_index = int(selection.split()[-1])
+    except (ValueError, IndexError):
+        messagebox.showerror("Selection Error", "Invalid webcam selection.")
+        return
+        
+    webcam_active.set()
+    threading.Thread(target=webcam_task, args=(device_index,), daemon=True).start()
+
+def capture_webcam_frame():
+    if current_webcam_frame:
+        captured_frames.append(current_webcam_frame.copy())
+        timestamp = time.strftime("%H:%M:%S")
+        webcam_listbox.insert(tk.END, f"Frame captured at {timestamp}")
+        webcam_listbox.see(tk.END)
+
+def display_captured_frame():
+    selection_indices = webcam_listbox.curselection()
+    if not selection_indices:
+        return
+    
+    selected_index = selection_indices[0]
+    
+    if 0 <= selected_index < len(captured_frames):
+        stop_all_activity()
+        image_to_display = captured_frames[selected_index]
+        processed = process_image(image_to_display)
+        if pixoo:
+            pixoo.draw_image(processed)
+            pixoo.push()
+        update_preview_label(processed)
+
+def remove_captured_frame():
+    indices = sorted(webcam_listbox.curselection(), reverse=True)
+    if not indices: return
+    for i in indices:
+        webcam_listbox.delete(i)
+        captured_frames.pop(i)
+
+def export_captured_frames():
+    if not captured_frames:
+        messagebox.showinfo("No Frames", "There are no captured frames to export.")
+        return
+    
+    directory = filedialog.askdirectory(title="Select Folder to Save Frames")
+    if not directory:
+        return
+        
+    try:
+        for i, frame_image in enumerate(captured_frames):
+            filename = f"captured_frame_{i+1}_{int(time.time())}.png"
+            save_path = os.path.join(directory, filename)
+            frame_image.save(save_path, "PNG")
+        messagebox.showinfo("Success", f"Successfully exported {len(captured_frames)} frames to:\n{directory}")
+    except Exception as e:
+        messagebox.showerror("Export Error", f"Failed to export frames: {e}")
+
+def import_captured_frames():
+    paths = filedialog.askopenfilenames(
+        title="Select Image Frames to Import",
+        filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp"), ("All files", "*.*")]
+    )
+    if not paths:
+        return
+        
+    for path in paths:
+        try:
+            image = Image.open(path).convert("RGB")
+            captured_frames.append(image)
+            webcam_listbox.insert(tk.END, f"Imported: {os.path.basename(path)}")
+        except Exception as e:
+            logging.error(f"Failed to import image {path}: {e}")
+            messagebox.showwarning("Import Error", f"Could not import file:\n{path}")
+    webcam_listbox.see(tk.END)
+
+def start_webcam_slideshow():
+    stop_all_activity()
+    if not captured_frames:
+        messagebox.showwarning("No Frames", "There are no captured frames to play in a slideshow.")
+        return
+        
+    try:
+        interval = int(webcam_interval_spinbox.get())
+    except ValueError:
+        interval = 5
+
+    shuffle = webcam_shuffle_var.get()
+    webcam_slideshow_active.set()
+    threading.Thread(target=webcam_slideshow_task, args=(interval, shuffle), daemon=True).start()
+
 #
 # GUI Setup
 #
@@ -932,10 +1178,11 @@ tab1 = ttk.Frame(notebook, padding=10)
 tab7 = ttk.Frame(notebook, padding=10)
 tab2 = ttk.Frame(notebook, padding=10)
 tab5 = ttk.Frame(notebook, padding=10)
+tab10 = ttk.Frame(notebook, padding=10)
 tab6 = ttk.Frame(notebook, padding=10)
 tab3 = ttk.Frame(notebook, padding=10)
 tab8 = ttk.Frame(notebook, padding=10)
-tab9 = ttk.Frame(notebook, padding=10) # AI Image Tab
+tab9 = ttk.Frame(notebook, padding=10) 
 tab4 = ttk.Frame(notebook, padding=10)
 
 # Add tabs to notebook in the correct order
@@ -943,6 +1190,7 @@ notebook.add(tab1, text='Image & Stream')
 notebook.add(tab7, text='Video Player')
 notebook.add(tab2, text='Playlist')
 notebook.add(tab5, text='Text Display')
+notebook.add(tab10, text='Webcam')
 notebook.add(tab6, text='Equalizer')
 notebook.add(tab3, text='System Monitor')
 notebook.add(tab8, text='RSS Feeds')
@@ -974,6 +1222,7 @@ listbox_frame = ttk.Frame(t2_left); listbox_frame.pack(fill="both", expand=True)
 ttk.Button(t2_right, text="Add Media", command=add_to_playlist).pack(fill="x", pady=2); ttk.Button(t2_right, text="Remove Sel.", command=remove_from_playlist).pack(fill="x", pady=2); ttk.Button(t2_right, text="Clear All", command=clear_playlist).pack(fill="x", pady=2)
 ttk.Separator(t2_right).pack(fill="x", pady=10); ttk.Button(t2_right, text="Save Playlist", command=save_playlist).pack(fill="x", pady=2); ttk.Button(t2_right, text="Load Playlist", command=load_playlist).pack(fill="x", pady=2); ttk.Separator(t2_right).pack(fill="x", pady=10)
 ttk.Label(t2_right, text="Interval (s):").pack(); interval_spinbox = tk.Spinbox(t2_right, from_=1, to=3600, width=10, justify=tk.CENTER); interval_spinbox.pack(fill="x", pady=2); interval_spinbox.delete(0, "end"); interval_spinbox.insert(0, "10")
+shuffle_playlist_var = tk.BooleanVar(value=False); ttk.Checkbutton(t2_right, text="Shuffle Playlist", variable=shuffle_playlist_var).pack(pady=5)
 ttk.Button(t2_right, text="START PLAYLIST", command=start_playlist, style="Accent.TButton").pack(fill="x", pady=(10,2)); style.configure("Accent.TButton", foreground="green")
 
 # Tab 3: System Monitor
@@ -996,7 +1245,9 @@ ttk.Button(tab3, text="START MONITOR", command=start_advanced_sysmon, style="Acc
 # Tab 4: Credits
 credits_center_frame = ttk.Frame(tab4); credits_center_frame.pack(expand=True)
 title_font = ("Segoe UI", 18, "bold"); author_font = ("Segoe UI", 12, "italic"); header_font = ("Segoe UI", 11, "bold"); body_font = ("Segoe UI", 10); link_font = ("Segoe UI", 10, "underline")
-ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0)); ttk.Label(credits_center_frame, text="by Doug Farmer", font=author_font).pack(pady=(0, 10))
+ttk.Label(credits_center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
+ttk.Label(credits_center_frame, text="by Doug Farmer", font=author_font).pack()
+ttk.Label(credits_center_frame, text="Version 1.5", font=author_font).pack(pady=(0, 10))
 discord_frame = ttk.Frame(credits_center_frame); discord_frame.pack(pady=5); ttk.Label(discord_frame, text="Discord:", font=body_font).pack(side=tk.LEFT); ttk.Label(discord_frame, text="wtfyd", font=link_font, foreground="#5865F2").pack(side=tk.LEFT)
 ttk.Separator(credits_center_frame, orient='horizontal').pack(fill='x', padx=20, pady=20); ttk.Label(credits_center_frame, text="Special Thanks", font=header_font).pack()
 ttk.Label(credits_center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech. This tool was built and expanded upon his great work.", font=body_font, wraplength=400, justify="center").pack(pady=5)
@@ -1078,15 +1329,63 @@ ai_prompt_frame.pack(fill="x")
 ai_prompt_entry = tk.Text(ai_prompt_frame, height=4, wrap="word")
 ai_prompt_entry.pack(fill="x", expand=True)
 ai_options_frame = ttk.LabelFrame(ai_main_frame, text="Generation Options", padding=5)
-ai_options_frame.pack(fill="x", pady=10)
+ai_options_frame.pack(fill="x", pady=5)
 pixel_style_var = tk.BooleanVar(value=True)
 hd_style_var = tk.BooleanVar(value=False)
 ttk.Checkbutton(ai_options_frame, text="Pixel Art Style (Recommended)", variable=pixel_style_var).pack(anchor="w")
 ttk.Checkbutton(ai_options_frame, text="HD Quality (Slower, uses more keywords)", variable=hd_style_var).pack(anchor="w")
 ai_status_label = ttk.Label(ai_main_frame, text="Status: Ready")
 ai_status_label.pack(pady=5)
-ttk.Button(ai_main_frame, text="GENERATE IMAGE", command=start_ai_image_generation, style="Accent.TButton").pack(fill="x", ipady=10)
-ttk.Label(ai_main_frame, text="Powered by Pollinations.ai. Generation may take 30-90 seconds.", justify="center").pack(pady=10)
+ai_btn_frame = ttk.Frame(ai_main_frame)
+ai_btn_frame.pack(fill="x", pady=5)
+ttk.Button(ai_btn_frame, text="GENERATE IMAGE", command=start_ai_image_generation, style="Accent.TButton").pack(side="left", fill="x", expand=True)
+ttk.Button(ai_btn_frame, text="Save Last Image", command=save_ai_image).pack(side="left", fill="x", expand=True, padx=(5,0))
+ttk.Label(ai_main_frame, text="Powered by Pollinations.ai. Generation may take 30-90 seconds.", justify="center").pack(pady=5)
+
+# Tab 10: Webcam
+webcam_main_frame = ttk.Frame(tab10, padding=5)
+webcam_main_frame.pack(fill="both", expand=True)
+webcam_left_frame = ttk.Frame(webcam_main_frame); webcam_left_frame.pack(side=tk.LEFT, fill="y", padx=(0, 10))
+webcam_right_frame = ttk.Frame(webcam_main_frame); webcam_right_frame.pack(side=tk.LEFT, fill="both", expand=True)
+# Left side
+device_frame = ttk.LabelFrame(webcam_left_frame, text="Live Controls", padding=5)
+device_frame.pack(fill="x")
+webcam_device_combobox = ttk.Combobox(device_frame, state="readonly", width=30)
+webcam_device_combobox.pack(pady=5)
+webcam_device_combobox.set("No webcams found")
+webcam_refresh_button = ttk.Button(device_frame, text="Find Webcams", command=start_webcam_discovery)
+webcam_refresh_button.pack(fill="x", pady=5)
+ttk.Button(device_frame, text="START WEBCAM", command=start_webcam, style="Accent.TButton").pack(fill="x", ipady=5, pady=5)
+webcam_capture_button = ttk.Button(device_frame, text="Capture Frame", command=capture_webcam_frame, state="disabled")
+webcam_capture_button.pack(fill="x", pady=5)
+# Right side: Captured frames and slideshow
+capture_frame = ttk.LabelFrame(webcam_right_frame, text="Captured Frames", padding=5)
+capture_frame.pack(fill="both", expand=True)
+webcam_listbox_frame = ttk.Frame(capture_frame)
+webcam_listbox_frame.pack(fill="both", expand=True, pady=5)
+webcam_scrollbar = ttk.Scrollbar(webcam_listbox_frame, orient=tk.VERTICAL)
+webcam_listbox = tk.Listbox(webcam_listbox_frame, yscrollcommand=webcam_scrollbar.set)
+webcam_scrollbar.config(command=webcam_listbox.yview)
+webcam_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+webcam_listbox.pack(side=tk.LEFT, fill="both", expand=True)
+# Frame management buttons
+frame_mgmt_frame = ttk.Frame(capture_frame)
+frame_mgmt_frame.pack(fill="x", pady=(5,0))
+ttk.Button(frame_mgmt_frame, text="Import", command=import_captured_frames).pack(side="left", fill="x", expand=True)
+ttk.Button(frame_mgmt_frame, text="Export All", command=export_captured_frames).pack(side="left", fill="x", expand=True, padx=5)
+ttk.Button(frame_mgmt_frame, text="Remove", command=remove_captured_frame).pack(side="left", fill="x", expand=True)
+# Slideshow controls
+slideshow_frame = ttk.LabelFrame(capture_frame, text="Slideshow", padding=5)
+slideshow_frame.pack(fill="x", pady=10)
+ttk.Button(slideshow_frame, text="Display Selected", command=display_captured_frame).pack(side="left", fill="x", expand=True)
+ttk.Separator(slideshow_frame, orient="vertical").pack(side="left", fill="y", padx=10, pady=5)
+ttk.Label(slideshow_frame, text="Interval (s):").pack(side="left")
+webcam_interval_spinbox = tk.Spinbox(slideshow_frame, from_=1, to=3600, width=5, justify=tk.CENTER)
+webcam_interval_spinbox.pack(side="left", padx=5)
+webcam_interval_spinbox.delete(0, "end"); webcam_interval_spinbox.insert(0, "5")
+webcam_shuffle_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(slideshow_frame, text="Shuffle", variable=webcam_shuffle_var).pack(side="left", padx=5)
+ttk.Button(slideshow_frame, text="Start Slideshow", command=start_webcam_slideshow).pack(side="left", padx=5)
 
 
 # This button is always visible at the bottom.
@@ -1101,7 +1400,9 @@ def on_closing():
 
 root.protocol("WM_DELETE_WINDOW", on_closing)
 
+# Initial population of devices
 populate_audio_devices()
+start_webcam_discovery()
 if DEFAULT_PIXOO_IP:
     threading.Thread(target=connect_to_pixoo, args=(DEFAULT_PIXOO_IP,), daemon=True).start()
 
