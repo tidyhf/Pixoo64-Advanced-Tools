@@ -2,9 +2,9 @@
 
 An advanced Python toolset for customizing and interacting with the Divoom Pixoo 64 display.
 
-Version 2.4 now live! Overhauled GIF/Video logic for smooth playback.
+Version 2.5 now live!
 
-![hippo](https://i.imgur.com/JE5OcNm.gif)
+![hippo](https://i.imgur.com/LbG1xKj.gif)
 ---
 
 ## 🚀 Overview
@@ -15,7 +15,7 @@ This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the 
 
 ## 🌟 Features
 
-- **Brand New UI**: To accommodate the extra features, the interface now uses a modern tab layout.
+- _NEW!_ **Brand New UI 2.0**: Upgraded to a more modern interface using customtkinter.
 - **GIF Support**: Just browse for any GIF and have it play directly on your Pixoo.
 - **Video Player**: Play short video clips on the Pixoo 64 (with frame conversion).
 - _Improved!_ **Advanced Playlists**: Create playlists with a mix of static images, animated GIFs **and** video. Set intervals, save, and load your favorites.
