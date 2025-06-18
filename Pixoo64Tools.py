@@ -1032,7 +1032,7 @@ class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Pixoo 64 Advanced Tools 2.6")
+        self.title("Pixoo 64 Advanced Tools 2.7")
         self.geometry("1280x720")
 
         customtkinter.set_appearance_mode("Dark")
@@ -1073,6 +1073,16 @@ class App(customtkinter.CTk):
                                             padx=20, pady=20)
         logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
 
+        ip_frame = customtkinter.CTkFrame(self.navigation_frame)
+        ip_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        ip_frame.grid_columnconfigure(1, weight=1)
+        customtkinter.CTkLabel(ip_frame, text="Pixoo IP:", font=self.label_font).grid(row=0, column=0, padx=(10,5), pady=10)
+        self.ip_entry = customtkinter.CTkEntry(ip_frame, placeholder_text="e.g. 192.168.1.239")
+        self.ip_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=10)
+        self.ip_entry.insert(0, DEFAULT_PIXOO_IP)
+        self.connect_button = customtkinter.CTkButton(ip_frame, text="Connect", width=80, command=self.on_connect_button_click)
+        self.connect_button.grid(row=0, column=2, padx=(5,10), pady=10)
+
         buttons_info = {
             "image": ("🖼️ Image/Stream", self.create_image_stream_frame),
             "video": ("▶️ Video Player", self.create_video_frame),
@@ -1101,13 +1111,13 @@ class App(customtkinter.CTk):
                                              hover_color=("gray70", "gray30"),
                                              anchor="w",
                                              font=self.button_font)
-            button.grid(row=i + 1, column=0, sticky="ew")
+            button.grid(row=i + 2, column=0, sticky="ew")
             self.nav_buttons[name] = button
 
         self.stop_button = customtkinter.CTkButton(self.navigation_frame, text="🛑 STOP ALL ACTIVITY",
                                                    command=stop_all_activity, fg_color="#D32F2F", hover_color="#B71C1C",
                                                    font=self.large_font)
-        self.stop_button.grid(row=14, column=0, padx=10, pady=10, sticky="s")
+        self.stop_button.grid(row=15, column=0, padx=10, pady=10, sticky="s")
 
 
     def create_all_content_frames(self):
@@ -1272,7 +1282,7 @@ class App(customtkinter.CTk):
         for f in files:
             if f not in playlist_files:
                 playlist_files.append(f)
-                self.add_item_to_list_frame(self.playlist_list_frame, os.path.basename(f), f)
+                self.add_item_to_list_frame(self.playlist_list_frame, os.path.basename(f), f, playlist_files)
 
     def remove_from_playlist(self):
         messagebox.showinfo("Info", "This feature needs to be adapted for the new UI.")
@@ -1283,20 +1293,29 @@ class App(customtkinter.CTk):
         for widget in self.playlist_list_frame.winfo_children():
             widget.destroy()
 
-    def add_item_to_list_frame(self, frame, item_text, item_path):
-        """Helper to add an item to a CTkScrollableFrame."""
+    def add_item_to_list_frame(self, frame, item_text, item_identifier, list_to_update=None, image=None):
         item_frame = customtkinter.CTkFrame(frame)
         item_frame.pack(fill="x", pady=2, padx=2)
+
+        if image:
+            thumb = image.resize((48, 48), Image.Resampling.NEAREST)
+            ctk_thumb = customtkinter.CTkImage(light_image=thumb, dark_image=thumb, size=(48, 48))
+            thumb_label = customtkinter.CTkLabel(item_frame, image=ctk_thumb, text="")
+            thumb_label.pack(side="left", padx=5, pady=5)
+
         label = customtkinter.CTkLabel(item_frame, text=item_text, anchor="w")
         label.pack(side="left", fill="x", expand=True, padx=5)
 
         def _remove():
-            if item_path in playlist_files: playlist_files.remove(item_path)
-            if item_path in rss_feed_urls: rss_feed_urls.remove(item_path)
+            if list_to_update is not None:
+                try:
+                    list_to_update.remove(item_identifier)
+                except ValueError:
+                    logging.warning("Item to remove was not found in the target list.")
             item_frame.destroy()
 
         remove_button = customtkinter.CTkButton(item_frame, text="✕", command=_remove, width=20, height=20, fg_color="transparent", hover_color="#D32F2F")
-        remove_button.pack(side="right")
+        remove_button.pack(side="right", padx=5)
 
     def save_playlist(self):
         if not playlist_files: messagebox.showwarning("Empty", "Playlist is empty."); return
@@ -1318,7 +1337,7 @@ class App(customtkinter.CTk):
                     file_path = line.strip()
                     if file_path:
                          playlist_files.append(file_path)
-                         self.add_item_to_list_frame(self.playlist_list_frame, os.path.basename(file_path), file_path)
+                         self.add_item_to_list_frame(self.playlist_list_frame, os.path.basename(file_path), file_path, playlist_files)
         except Exception as e: messagebox.showerror("Error", f"Could not load playlist: {e}")
 
     def update_text_preview(self, event=None):
@@ -1435,7 +1454,7 @@ class App(customtkinter.CTk):
             return
 
         rss_feed_urls.append(url)
-        self.add_item_to_list_frame(self.rss_listbox_frame, url, url)
+        self.add_item_to_list_frame(self.rss_listbox_frame, url, url, rss_feed_urls)
         self.rss_url_entry.delete(0, "end")
         save_config(app_config)
 
@@ -1651,14 +1670,21 @@ class App(customtkinter.CTk):
             messagebox.showerror("Selection Error", "Invalid webcam selection.")
             return
 
+        img = Image.new('RGB', (64, 64), 'black')
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.load_default()
+        draw.text((8, 28), "Loading...", font=font, fill="white")
+        update_preview_label(img)
+
         webcam_active.set()
         threading.Thread(target=self.webcam_task, args=(device_index,), daemon=True).start()
 
     def capture_webcam_frame(self):
         if current_webcam_frame:
-            captured_frames.append(current_webcam_frame.copy())
+            frame_copy = current_webcam_frame.copy()
+            captured_frames.append(frame_copy)
             timestamp = time.strftime("%H:%M:%S")
-            self.add_item_to_list_frame(self.webcam_listbox_frame, f"Frame captured at {timestamp}", current_webcam_frame)
+            self.add_item_to_list_frame(self.webcam_listbox_frame, f"Frame at {timestamp}", frame_copy, captured_frames, image=frame_copy)
 
 
     def start_webcam_slideshow(self):
@@ -1846,6 +1872,7 @@ class App(customtkinter.CTk):
 
         self.add_frame_to_designer_list(f"Frame {len(animation_frames)}")
         self.on_frame_select(current_frame_index)
+        self.load_image_to_canvas_data(current_designer_image)
 
 
     def duplicate_animation_frame(self):
@@ -1886,7 +1913,7 @@ class App(customtkinter.CTk):
     def add_frame_to_designer_list(self, text):
         frame_button = customtkinter.CTkButton(self.designer_frame_listbox, text=text, fg_color="transparent",
                                                command=lambda i=len(animation_frames)-1: self.on_frame_select(i))
-        frame_button.pack(fill="x", padx=2, pady=2)
+        frame_button.pack(side="left", padx=2, pady=2)
 
 
     def on_frame_select(self, selection_index):
@@ -1932,17 +1959,7 @@ class App(customtkinter.CTk):
     # --- Left Column Setup ---
         left_col = customtkinter.CTkFrame(frame)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
-        left_col.grid_columnconfigure(0, weight=1) # Make column inside left_col expand
-
-        ip_frame = customtkinter.CTkFrame(left_col)
-        ip_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
-        ip_frame.grid_columnconfigure(1, weight=1)
-        customtkinter.CTkLabel(ip_frame, text="Pixoo IP:", font=self.label_font).grid(row=0, column=0, padx=(10,5), pady=10)
-        self.ip_entry = customtkinter.CTkEntry(ip_frame, placeholder_text="e.g. 192.168.1.239")
-        self.ip_entry.grid(row=0, column=1, sticky="ew", padx=5, pady=10)
-        self.ip_entry.insert(0, DEFAULT_PIXOO_IP)
-        self.connect_button = customtkinter.CTkButton(ip_frame, text="Connect", width=80, command=self.on_connect_button_click)
-        self.connect_button.grid(row=0, column=2, padx=(5,10), pady=10)
+        left_col.grid_columnconfigure(0, weight=1)
 
         media_frame = customtkinter.CTkFrame(left_col)
         media_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -1960,13 +1977,20 @@ class App(customtkinter.CTk):
         customtkinter.CTkButton(stream_frame, text="Start Fullscreen Stream", command=self.start_streaming).pack(fill="x", padx=10, pady=10)
         self.use_region_var = customtkinter.BooleanVar(value=False)
         customtkinter.CTkCheckBox(stream_frame, text="Use Region:", variable=self.use_region_var).pack(anchor="w", padx=10, pady=(0,5))
+        
         region_frame = customtkinter.CTkFrame(stream_frame, fg_color="transparent")
         region_frame.pack(fill="x", padx=10, pady=(0,10))
         region_frame.grid_columnconfigure((0,1,2,3), weight=1)
-        self.region_x_entry = customtkinter.CTkEntry(region_frame, placeholder_text="X"); self.region_x_entry.insert(0, "0"); self.region_x_entry.grid(row=0, column=0, sticky="ew", padx=(0,5))
-        self.region_y_entry = customtkinter.CTkEntry(region_frame, placeholder_text="Y"); self.region_y_entry.insert(0, "0"); self.region_y_entry.grid(row=0, column=1, sticky="ew", padx=5)
-        self.region_w_entry = customtkinter.CTkEntry(region_frame, placeholder_text="W"); self.region_w_entry.insert(0, "800"); self.region_w_entry.grid(row=0, column=2, sticky="ew", padx=5)
-        self.region_h_entry = customtkinter.CTkEntry(region_frame, placeholder_text="H"); self.region_h_entry.insert(0, "600"); self.region_h_entry.grid(row=0, column=3, sticky="ew", padx=(5,0))
+
+        customtkinter.CTkLabel(region_frame, text="X").grid(row=0, column=0)
+        customtkinter.CTkLabel(region_frame, text="Y").grid(row=0, column=1)
+        customtkinter.CTkLabel(region_frame, text="W").grid(row=0, column=2)
+        customtkinter.CTkLabel(region_frame, text="H").grid(row=0, column=3)
+
+        self.region_x_entry = customtkinter.CTkEntry(region_frame, placeholder_text="X"); self.region_x_entry.insert(0, "0"); self.region_x_entry.grid(row=1, column=0, sticky="ew", padx=(0,5))
+        self.region_y_entry = customtkinter.CTkEntry(region_frame, placeholder_text="Y"); self.region_y_entry.insert(0, "0"); self.region_y_entry.grid(row=1, column=1, sticky="ew", padx=5)
+        self.region_w_entry = customtkinter.CTkEntry(region_frame, placeholder_text="W"); self.region_w_entry.insert(0, "800"); self.region_w_entry.grid(row=1, column=2, sticky="ew", padx=5)
+        self.region_h_entry = customtkinter.CTkEntry(region_frame, placeholder_text="H"); self.region_h_entry.insert(0, "600"); self.region_h_entry.grid(row=1, column=3, sticky="ew", padx=(5,0))
 
         options_frame = customtkinter.CTkFrame(left_col)
         options_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 10))
@@ -2071,9 +2095,12 @@ class App(customtkinter.CTk):
         pos_frame = customtkinter.CTkFrame(style_frame, fg_color="transparent")
         pos_frame.pack(fill="x", padx=10, pady=5)
         pos_frame.grid_columnconfigure((0,1,2), weight=1)
-        self.font_size_entry = customtkinter.CTkEntry(pos_frame, placeholder_text="Size"); self.font_size_entry.insert(0,"16"); self.font_size_entry.grid(row=0,column=0, sticky="ew", padx=(0,5))
-        self.pos_x_entry = customtkinter.CTkEntry(pos_frame, placeholder_text="X"); self.pos_x_entry.insert(0,"0"); self.pos_x_entry.grid(row=0,column=1, sticky="ew", padx=5)
-        self.pos_y_entry = customtkinter.CTkEntry(pos_frame, placeholder_text="Y"); self.pos_y_entry.insert(0,"0"); self.pos_y_entry.grid(row=0,column=2, sticky="ew", padx=(5,0))
+        customtkinter.CTkLabel(pos_frame, text="Size").grid(row=0, column=0)
+        customtkinter.CTkLabel(pos_frame, text="X").grid(row=0, column=1)
+        customtkinter.CTkLabel(pos_frame, text="Y").grid(row=0, column=2)
+        self.font_size_entry = customtkinter.CTkEntry(pos_frame, placeholder_text="Size"); self.font_size_entry.insert(0,"16"); self.font_size_entry.grid(row=1,column=0, sticky="ew", padx=(0,5))
+        self.pos_x_entry = customtkinter.CTkEntry(pos_frame, placeholder_text="X"); self.pos_x_entry.insert(0,"0"); self.pos_x_entry.grid(row=1,column=1, sticky="ew", padx=5)
+        self.pos_y_entry = customtkinter.CTkEntry(pos_frame, placeholder_text="Y"); self.pos_y_entry.insert(0,"0"); self.pos_y_entry.grid(row=1,column=2, sticky="ew", padx=(5,0))
 
         color_frame = customtkinter.CTkFrame(style_frame, fg_color="transparent")
         color_frame.pack(fill="x", padx=10, pady=10)
@@ -2382,7 +2409,7 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
         customtkinter.CTkLabel(center_frame, text="by Doug Farmer", font=author_font).pack()
-        customtkinter.CTkLabel(center_frame, text="Version 2.6", font=author_font).pack(pady=(0, 10))
+        customtkinter.CTkLabel(center_frame, text="Version 2.7", font=author_font).pack(pady=(0, 10))
 
         customtkinter.CTkLabel(center_frame, text="Special Thanks", font=header_font).pack(pady=(20, 5))
         customtkinter.CTkLabel(center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech.\nThis tool was built and expanded upon his great work.", font=body_font, justify="center").pack()
