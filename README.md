@@ -2,7 +2,7 @@
 
 An advanced Python toolset for customizing and interacting with the Divoom Pixoo 64 display.
 
-Version 2.6 now live!
+Version 2.7 now live!
 
 ![hippo](https://i.imgur.com/LbG1xKj.gif)
 ---
