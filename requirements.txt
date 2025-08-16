@@ -9,3 +9,4 @@ feedparser
 requests
 customtkinter
 spotipy
+icalendar

@@ -5,7 +5,7 @@
 # This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
 # mixed-media playlists, a live system performance monitor, a powerful custom text displayer,
 # a live audio visualizer, an RSS feed reader, a live webcam viewer, a live pixel art designer,
-# and a Spotify 'Now Playing' integration with live lyrics.
+# a Spotify 'Now Playing' integration with live lyrics, and a live calendar display.
 #
 # Main libraries used:
 # - customtkinter: For the modern GUI components.
@@ -18,6 +18,7 @@
 # - feedparser: For parsing RSS and Atom feeds.
 # - requests: For making API calls to web services.
 # - spotipy: For interfacing with the Spotify API.
+# - icalendar: For parsing .ics calendar files.
 #
 import logging
 import time
@@ -47,6 +48,10 @@ import contextlib
 import webbrowser
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from icalendar import Calendar
+from datetime import datetime, date, timedelta
+import pytz
+
 
 try:
     import pynvml
@@ -83,13 +88,15 @@ webcam_active = threading.Event()
 webcam_slideshow_active = threading.Event()
 pixel_animation_active = threading.Event()
 spotify_active = threading.Event()
-ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active, pixel_animation_active, spotify_active]
+calendar_active = threading.Event()
+ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active, pixel_animation_active, spotify_active, calendar_active]
 
 show_grid = True
 resize_method = Image.Resampling.BICUBIC
 last_source_image = None
 playlist_files = []
 rss_feed_urls = []
+calendar_urls = []
 current_gif_path = None
 current_video_path = None
 text_color = (255, 255, 255)
@@ -128,11 +135,12 @@ filter_options = {
 # --- Configuration Management ---
 
 def load_config():
-    global rss_feed_urls, spotify_refresh_token
+    global rss_feed_urls, calendar_urls, spotify_refresh_token
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config_data = json.load(f)
             rss_feed_urls = config_data.get('rss_feeds', [])
+            calendar_urls = config_data.get('calendar_urls', [])
             # Load Spotify specific config
             spotify_refresh_token = config_data.get('spotify_refresh_token', None)
             DEFAULT_SPOTIFY_CLIENT_SECRET = config_data.get('spotify_client_secret', '')
@@ -142,6 +150,7 @@ def load_config():
 def save_config(data):
     global spotify_refresh_token
     data['rss_feeds'] = rss_feed_urls
+    data['calendar_urls'] = calendar_urls
     # Save Spotify specific config
     if app and hasattr(app, 'spotify_client_id_entry'):
         data['spotify_client_id'] = app.spotify_client_id_entry.get()
@@ -590,7 +599,7 @@ def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
             left, top, right, bottom = temp_draw.textbbox((0,0), text_to_scroll, font=font)
             text_width, text_height = right - left, bottom - top
 
-            x_pos = (64 - text_width) // 2
+            x_pos = 0 # Start from the left edge
 
             full_text_image = Image.new('RGBA', (text_width, text_height))
             draw = ImageDraw.Draw(full_text_image)
@@ -644,7 +653,7 @@ def rss_task(delay_between_headlines, scroll_speed_ms):
 
             logging.info(f"Fetching RSS feed: {url}")
             try:
-                feed = feedparser.parse(url, agent="Pixoo64AdvancedTools/2.5")
+                feed = feedparser.parse(url, agent="Pixoo64AdvancedTools/2.8")
                 if feed.bozo:
                     logging.warning(f"Feed may be malformed: {url}, Bozo reason: {feed.bozo_exception}")
 
@@ -669,6 +678,153 @@ def rss_task(delay_between_headlines, scroll_speed_ms):
                 rss_active.wait(60)
 
     logging.info("RSS Feed task stopped.")
+
+def calendar_task(scroll_speed_ms, refresh_interval_minutes):
+    """
+    This function has been completely rewritten to provide a static header
+    and independently scrolling lines for calendar events, per user request.
+    """
+    try:
+        font_events = ImageFont.truetype("arial.ttf", 10)
+        font_header = ImageFont.truetype("arialbd.ttf", 10)
+    except IOError:
+        font_events = ImageFont.load_default()
+        font_header = ImageFont.load_default()
+
+    last_refresh_time = 0
+    events_today_data = []
+    scroll_states = {} # Stores {'text': str, 'width': int, 'offset': int, 'pause': int} for each line
+
+    PAUSE_DURATION_FRAMES = 90 # How long to pause at the start/end of a scroll (e.g., 90 frames = 3s at 30fps)
+
+    while calendar_active.is_set():
+        current_time = time.monotonic()
+
+        # --- 1. Data Fetching and Processing ---
+        if not events_today_data or (current_time - last_refresh_time > refresh_interval_minutes * 60):
+            logging.info("Refreshing calendar data...")
+            last_refresh_time = current_time
+            
+            # Reset state for new data
+            events_today_data.clear()
+            scroll_states.clear()
+
+            if not calendar_urls:
+                logging.warning("Calendar URL list is empty.")
+                app.after(0, lambda: messagebox.showwarning("Empty", "Your Calendar URL list is empty."))
+                calendar_active.clear()
+                return
+
+            all_events = []
+            now_utc = datetime.now(pytz.utc)
+            today_date_utc = now_utc.date()
+
+            for url in calendar_urls:
+                try:
+                    response = requests.get(url, timeout=15)
+                    response.raise_for_status()
+                    cal = Calendar.from_ical(response.content)
+
+                    for component in cal.walk('VEVENT'):
+                        dtstart = component.get('dtstart').dt
+                        if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
+                            event_date = dtstart
+                        else:
+                            if dtstart.tzinfo is None:
+                                dtstart = pytz.utc.localize(dtstart)
+                            event_date = dtstart.astimezone(pytz.utc).date()
+                        
+                        if event_date == today_date_utc:
+                            all_events.append({
+                                'summary': str(component.get('summary')),
+                                'start': dtstart,
+                                'all_day': isinstance(dtstart, date) and not isinstance(dtstart, datetime)
+                            })
+                except Exception as e:
+                    logging.error(f"Failed to process calendar URL {url}: {e}")
+
+            all_events.sort(key=lambda x: x['start'])
+            events_today_data = all_events
+            
+            # Initialize scroll states for the new events
+            for i, event in enumerate(events_today_data):
+                if event['all_day']:
+                    time_str = "All-Day"
+                else:
+                    local_tz = datetime.now().astimezone().tzinfo
+                    local_time = event['start'].astimezone(local_tz)
+                    time_str = local_time.strftime('%I:%M%p') # e.g., 03:30PM
+                
+                full_text = f"{time_str} {event['summary']}"
+                text_width = font_events.getbbox(full_text)[2]
+                
+                scroll_states[i] = {
+                    'text': full_text,
+                    'width': text_width,
+                    'offset': 0,
+                    'pause': PAUSE_DURATION_FRAMES # Start with a pause
+                }
+
+
+        # --- 2. Drawing ---
+        img = Image.new('RGB', (64, 64), 'black')
+        draw = ImageDraw.Draw(img)
+
+        # Draw Header
+        header_text = datetime.now().strftime("%a, %b %d").upper() # e.g., SAT, AUG 16
+        header_width = font_header.getbbox(header_text)[2]
+        draw.rectangle([0, 0, 63, 11], fill=(40, 40, 40))
+        draw.line([0, 11, 63, 11], fill=(80, 80, 80))
+        draw.text(((64 - header_width) / 2, 1), header_text, font=font_header, fill=(200, 200, 255))
+
+        # Draw Event Lines
+        y_pos = 14
+        for i, event in enumerate(events_today_data):
+            if y_pos > 60: break
+            
+            state = scroll_states.get(i)
+            if not state: continue
+
+            # If text fits, just draw it statically
+            if state['width'] <= 64:
+                draw.text((1, y_pos), state['text'], font=font_events, fill="white")
+            # Otherwise, handle scrolling logic
+            else:
+                # If paused, don't increment offset
+                if state['pause'] > 0:
+                    state['pause'] -= 1
+                else:
+                    state['offset'] += 1
+                
+                # Create a surface for the full text to scroll
+                text_surface = Image.new('RGB', (state['width'], 10), 'black')
+                text_draw = ImageDraw.Draw(text_surface)
+                text_draw.text((0, 0), state['text'], font=font_events, fill="white")
+                
+                # If scrolled past the end, loop back with a pause
+                if state['offset'] > state['width'] - 64 + 30: # +30 adds a tail pause
+                    state['offset'] = 0
+                    state['pause'] = PAUSE_DURATION_FRAMES
+
+                # Crop the visible part and paste it onto the main image
+                scroll_box = (state['offset'], 0, state['offset'] + 64, 10)
+                img.paste(text_surface.crop(scroll_box), (0, y_pos))
+
+            y_pos += 12
+
+        # --- 3. Push to Device & Preview ---
+        try:
+            if pixoo:
+                pixoo.draw_image(img)
+                pixoo.push()
+            update_preview_label(img)
+        except Exception as e:
+            logging.error(f"Failed to push calendar frame to Pixoo: {e}")
+
+        # --- 4. Animation Delay ---
+        calendar_active.wait(scroll_speed_ms / 1000.0)
+    
+    logging.info("Calendar task stopped.")
 
 
 def equalizer_task(device_id, effect):
@@ -1032,7 +1188,7 @@ class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Pixoo 64 Advanced Tools 2.7")
+        self.title("Pixoo 64 Advanced Tools 2.8")
         self.geometry("1280x720")
 
         customtkinter.set_appearance_mode("Dark")
@@ -1048,7 +1204,7 @@ class App(customtkinter.CTk):
 
         self.navigation_frame = customtkinter.CTkFrame(self, corner_radius=0)
         self.navigation_frame.grid(row=0, column=0, sticky="nsw")
-        self.navigation_frame.grid_rowconfigure(13, weight=1)
+        self.navigation_frame.grid_rowconfigure(14, weight=1)
         self.create_navigation_frame()
 
         self.content_frames = {}
@@ -1092,6 +1248,7 @@ class App(customtkinter.CTk):
             "webcam": ("📷 Webcam", self.create_webcam_frame),
             "equalizer": ("🎶 Equalizer", self.create_equalizer_frame),
             "sysmon": ("💻 Sys Monitor", self.create_sysmon_frame),
+            "calendar": ("📅 Calendar", self.create_calendar_frame),
             "rss": ("📰 RSS Feeds", self.create_rss_frame),
             "spotify": ("🎵 Spotify", self.create_spotify_frame),
             "ai": ("🤖 AI Image Gen", self.create_ai_frame),
@@ -1117,7 +1274,7 @@ class App(customtkinter.CTk):
         self.stop_button = customtkinter.CTkButton(self.navigation_frame, text="🛑 STOP ALL ACTIVITY",
                                                    command=stop_all_activity, fg_color="#D32F2F", hover_color="#B71C1C",
                                                    font=self.large_font)
-        self.stop_button.grid(row=15, column=0, padx=10, pady=10, sticky="s")
+        self.stop_button.grid(row=16, column=0, padx=10, pady=10, sticky="s")
 
 
     def create_all_content_frames(self):
@@ -1130,6 +1287,7 @@ class App(customtkinter.CTk):
             "webcam": ("📷 Webcam", self.create_webcam_frame),
             "equalizer": ("🎶 Equalizer", self.create_equalizer_frame),
             "sysmon": ("💻 Sys Monitor", self.create_sysmon_frame),
+            "calendar": ("📅 Calendar", self.create_calendar_frame),
             "rss": ("📰 RSS Feeds", self.create_rss_frame),
             "spotify": ("🎵 Spotify", self.create_spotify_frame),
             "ai": ("🤖 AI Image Gen", self.create_ai_frame),
@@ -1313,6 +1471,9 @@ class App(customtkinter.CTk):
                 except ValueError:
                     logging.warning("Item to remove was not found in the target list.")
             item_frame.destroy()
+            if list_to_update == calendar_urls:
+                save_config(app_config)
+
 
         remove_button = customtkinter.CTkButton(item_frame, text="✕", command=_remove, width=20, height=20, fg_color="transparent", hover_color="#D32F2F")
         remove_button.pack(side="right", padx=5)
@@ -1469,6 +1630,35 @@ class App(customtkinter.CTk):
 
         rss_active.set()
         threading.Thread(target=rss_task, args=(delay, speed), daemon=True).start()
+
+    def add_calendar_url(self):
+        url = self.calendar_url_entry.get().strip()
+        if not url: return
+        if url in calendar_urls:
+            messagebox.showinfo("Duplicate", "This calendar URL is already in the list.")
+            return
+
+        calendar_urls.append(url)
+        self.add_item_to_list_frame(self.calendar_listbox_frame, url, url, calendar_urls)
+        self.calendar_url_entry.delete(0, "end")
+        save_config(app_config)
+
+    def start_calendar_display(self):
+        stop_all_activity()
+        if not calendar_urls:
+            messagebox.showwarning("Empty", "Please add at least one calendar URL.")
+            return
+        
+        try:
+            speed = int(self.calendar_speed_entry.get())
+            refresh = int(self.calendar_refresh_entry.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Please enter valid numbers for speed and refresh interval.")
+            return
+
+        calendar_active.set()
+        threading.Thread(target=calendar_task, args=(speed, refresh), daemon=True).start()
+
 
     def handle_spotify_auth(self, silent=False):
         global sp, spotify_refresh_token
@@ -2291,6 +2481,50 @@ class App(customtkinter.CTk):
 
         return frame
 
+    def create_calendar_frame(self):
+        frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        frame.grid_columnconfigure(0, weight=3)
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_rowconfigure(0, weight=1)
+
+        # Left Column for URL Management
+        left_col = customtkinter.CTkFrame(frame)
+        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+        left_col.grid_rowconfigure(2, weight=1)
+
+        customtkinter.CTkLabel(left_col, text="Calendar Configuration", font=self.large_font).pack(anchor="w", padx=10, pady=10)
+        customtkinter.CTkLabel(left_col, text="Add public or private iCalendar (.ics) URLs below.", justify="left").pack(anchor="w", padx=10)
+        
+        url_frame = customtkinter.CTkFrame(left_col)
+        url_frame.pack(fill="x", padx=10, pady=(10,10))
+        url_frame.grid_columnconfigure(0, weight=1)
+        self.calendar_url_entry = customtkinter.CTkEntry(url_frame, placeholder_text="Paste .ics URL here")
+        self.calendar_url_entry.grid(row=0, column=0, sticky="ew", padx=(0,5))
+        customtkinter.CTkButton(url_frame, text="Add", command=self.add_calendar_url, width=60).grid(row=0, column=1)
+
+        self.calendar_listbox_frame = customtkinter.CTkScrollableFrame(left_col, label_text="Your Calendar URLs")
+        self.calendar_listbox_frame.pack(fill="both", expand=True, padx=10, pady=(0,10))
+        for url in calendar_urls:
+            self.add_item_to_list_frame(self.calendar_listbox_frame, url, url, calendar_urls)
+
+        # Right Column for Settings and Control
+        right_col = customtkinter.CTkFrame(frame)
+        right_col.grid(row=0, column=1, sticky="nsew")
+
+        customtkinter.CTkLabel(right_col, text="Display Settings", font=self.large_font).pack(padx=10, pady=10, anchor="w")
+
+        customtkinter.CTkLabel(right_col, text="Scroll Speed (ms frame delay):").pack(anchor="w", padx=10)
+        self.calendar_speed_entry = customtkinter.CTkEntry(right_col); self.calendar_speed_entry.insert(0, "33")
+        self.calendar_speed_entry.pack(fill="x", padx=10, pady=(0,10))
+
+        customtkinter.CTkLabel(right_col, text="Refresh Interval (minutes):").pack(anchor="w", padx=10)
+        self.calendar_refresh_entry = customtkinter.CTkEntry(right_col); self.calendar_refresh_entry.insert(0, "15")
+        self.calendar_refresh_entry.pack(fill="x", padx=10, pady=(0,10))
+        
+        customtkinter.CTkButton(right_col, text="START CALENDAR", command=self.start_calendar_display, height=40).pack(fill="x", padx=10, pady=20)
+
+        return frame
+
     def create_rss_frame(self):
         frame = customtkinter.CTkFrame(self, fg_color="transparent")
         frame.grid_columnconfigure(0, weight=3)
@@ -2313,7 +2547,7 @@ class App(customtkinter.CTk):
         self.rss_listbox_frame = customtkinter.CTkScrollableFrame(left_col, label_text="Your Feeds")
         self.rss_listbox_frame.pack(fill="both", expand=True, padx=10, pady=(0,10))
         for url in rss_feed_urls:
-            self.add_item_to_list_frame(self.rss_listbox_frame, url, url)
+            self.add_item_to_list_frame(self.rss_listbox_frame, url, url, rss_feed_urls)
 
         right_col = customtkinter.CTkFrame(frame)
         right_col.grid(row=0, column=1, sticky="nsew")
@@ -2409,7 +2643,7 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
         customtkinter.CTkLabel(center_frame, text="by Doug Farmer", font=author_font).pack()
-        customtkinter.CTkLabel(center_frame, text="Version 2.7", font=author_font).pack(pady=(0, 10))
+        customtkinter.CTkLabel(center_frame, text="Version 2.8", font=author_font).pack(pady=(0, 10))
 
         customtkinter.CTkLabel(center_frame, text="Special Thanks", font=header_font).pack(pady=(20, 5))
         customtkinter.CTkLabel(center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech.\nThis tool was built and expanded upon his great work.", font=body_font, justify="center").pack()
