@@ -2,22 +2,22 @@
 
 An advanced Python toolset for customizing and interacting with the Divoom Pixoo 64 display.
 
-Version 2.7 now live!
+Version 3.0 now live!
 
 ![hippo](https://i.imgur.com/LbG1xKj.gif)
 ---
 
 ## 🚀 Overview
 
-This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the foundational work of **MikeTheTech**. It provides advanced functionalities to customize and interact with your Pixoo 64 device.
+This project is an enhanced toolset for the Divoom Pixoo 64, it provides advanced functionalities to customize and interact with your Pixoo 64 device.
 
 ---
 
 ## 🌟 Features
 
-- _NEW!_ **Brand New UI 2.0**: Upgraded to a more modern interface using customtkinter.
-- **GIF Support**: Just browse for any GIF and have it play directly on your Pixoo.
-- **Video Player**: Play short video clips on the Pixoo 64 (with frame conversion).
+- **Brand New UI 2.0**: Upgraded to a more modern interface using customtkinter.
+- _Improved!_ **GIF Support**: Just browse for any GIF and have it play directly on your Pixoo.
+- _Improved!_ **Video Player**: Play short video clips on the Pixoo 64 (with frame conversion).
 - _Improved!_ **Advanced Playlists**: Create playlists with a mix of static images, animated GIFs **and** video. Set intervals, save, and load your favorites.
 - **Selectable Screen Streaming**: Stream a specific portion of your screen—perfect for apps or widgets.
 - **Live PC System Monitor**: Monitor real-time CPU, GPU, RAM, and network stats.
@@ -27,7 +27,8 @@ This project is an enhanced toolset for the Divoom Pixoo 64, expanding upon the 
 - **AI Image Generation**: Generate AI images within the app for free with zero setup.
 - **Webcam Streamer**: Stream your webcam live and save frame for easy display, with added shuffle and import/export functions!
 - **Pixel Designer**: Fully featured pixel designer with animation support added!
-- _NEW!_ **Spotify Album Art** Displays the album art, progress bar and Lyrics! Work in progress, will improve later.
+- **Spotify Album Art** Displays the album art, progress bar and Lyrics! Work in progress, will improve later.
+- _NEW!_ **Divoom Cloud Gallery** Log in with your Divoom account to have access to the entire Divoom Cloud Library with support for likes and comments!
 
 ---
 
