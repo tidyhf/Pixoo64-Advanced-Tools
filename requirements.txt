@@ -6,7 +6,8 @@ soundcard
 pynvml
 opencv-python
 feedparser
-requests
 customtkinter
 spotipy
 icalendar
+pycryptodome
+lzallright

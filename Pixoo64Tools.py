@@ -1,16 +1,18 @@
+
 #
-# Pixoo 64 Advanced Tools by Doug Farmer
+# Pixoo 64 Advanced Tools by Doug Farmer (v3.0)
 #
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
 # This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
 # mixed-media playlists, a live system performance monitor, a powerful custom text displayer,
 # a live audio visualizer, an RSS feed reader, a live webcam viewer, a live pixel art designer,
-# a Spotify 'Now Playing' integration with live lyrics, and a live calendar display.
+# a Spotify 'Now Playing' integration with live lyrics, a live calendar display,
+# and a Cloud Gallery Browser.
 #
 # Main libraries used:
 # - customtkinter: For the modern GUI components.
 # - Pillow (PIL): For all image processing.
-# - pixoo: For communicating with the Pixoo 64 device.
+# - pixoo1664: For communicating with the Pixoo 64 device.
 # - psutil: For fetching system CPU, RAM, and Network statistics.
 # - pynvml: For fetching NVIDIA GPU statistics.
 # - numpy & soundcard: For the audio visualizer.
@@ -19,29 +21,15 @@
 # - requests: For making API calls to web services.
 # - spotipy: For interfacing with the Spotify API.
 # - icalendar: For parsing .ics calendar files.
+# - pycryptodome & lzallright: For decoding Divoom Cloud Gallery files.
 #
 import logging
 import time
 import threading
 import json
+import tempfile
 import os
 import customtkinter
-
-# This MUST be set before cv2 is imported to prevent console spam
-os.environ["OPENCV_LOG_LEVEL"] = "OFF"
-
-import random
-import tkinter as tk
-from tkinter import messagebox, filedialog, colorchooser
-from PIL import ImageGrab, Image, ImageTk, ImageDraw, ImageFilter, ImageSequence, ImageFont
-from pixoo import Pixoo
-import psutil
-import numpy as np
-import soundcard as sc
-import warnings
-import cv2
-import feedparser
-import requests
 import io
 import sys
 import contextlib
@@ -51,7 +39,28 @@ from spotipy.oauth2 import SpotifyOAuth
 from icalendar import Calendar
 from datetime import datetime, date, timedelta
 import pytz
+import hashlib
+import struct
+from struct import unpack
+from enum import Enum
+from typing import List, Tuple, Union
+import random
+import tkinter as tk
+from tkinter import messagebox, filedialog, colorchooser, BOTH
+from PIL import ImageGrab, Image, ImageTk, ImageDraw, ImageFilter, ImageSequence, ImageFont, ImageTk
+from pixoo import Pixoo as PixooStream
+from pixoo1664 import Pixoo as PixooUpload
+import psutil
+import numpy as np
+import soundcard as sc
+import warnings
 
+# This MUST be set before cv2 is imported to prevent console spam
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
+
+import cv2
+import feedparser
+import requests
 
 try:
     import pynvml
@@ -59,6 +68,15 @@ try:
     NVIDIA_GPU_SUPPORT = True
 except Exception:
     NVIDIA_GPU_SUPPORT = False
+
+# Check for Decoder dependencies
+try:
+    from Crypto.Cipher import AES
+    import lzallright
+    DIVOOM_DECODER_SUPPORT = True
+except ImportError:
+    print("WARNING: 'pycryptodome' or 'lzallright' not found. Cloud Gallery will not work.")
+    DIVOOM_DECODER_SUPPORT = False
 
 # Suppress a specific, harmless warning from the soundcard library
 warnings.filterwarnings('ignore', category=sc.SoundcardRuntimeWarning)
@@ -72,7 +90,8 @@ logging.basicConfig(
 
 # --- Global State and Configuration ---
 
-pixoo = None
+pixoo_stream = None
+pixoo_upload = None
 CONFIG_FILE = 'config.json'
 
 streaming = threading.Event()
@@ -92,7 +111,7 @@ calendar_active = threading.Event()
 ALL_EVENTS = [streaming, playlist_active, gif_active, sysmon_active, text_active, equalizer_active, video_active, rss_active, ai_image_active, webcam_active, webcam_slideshow_active, pixel_animation_active, spotify_active, calendar_active]
 
 show_grid = True
-resize_method = Image.Resampling.BICUBIC
+resize_method = Image.Resampling.NEAREST
 last_source_image = None
 playlist_files = []
 rss_feed_urls = []
@@ -124,6 +143,18 @@ spotify_refresh_token = None
 current_spotify_track_id = None
 current_lyrics = None
 
+# Cloud Gallery state variables
+DIV_BASE_URL = "https://app.divoom-gz.com"
+DIV_FILE_URL = "https://f.divoom-gz.com"
+DIV_GET_COMMENTS_ENDPOINT = "https://app.divoom-gz.com/Comment/GetCommentListV3"
+GALLERY_THUMBNAILS = {} 
+
+# --- Divoom Cloud Auth Variables ---
+DIV_USER_ID = "0"
+DIV_TOKEN = "" 
+DIV_LOGIN_EMAIL = ""
+DIV_LOGIN_PASSWORD = ""
+
 filter_options = {
     "NONE": None, "BLUR": ImageFilter.BLUR, "CONTOUR": ImageFilter.CONTOUR,
     "DETAIL": ImageFilter.DETAIL, "EDGE_ENHANCE": ImageFilter.EDGE_ENHANCE,
@@ -132,33 +163,265 @@ filter_options = {
     "SMOOTH": ImageFilter.SMOOTH, "SMOOTH_MORE": ImageFilter.SMOOTH_MORE
 }
 
-# --- Configuration Management ---
+# ============================================================================
+# DIVOOM PIXEL BEAN DECODER LOGIC
+# This section handles the proprietary .dat format used by Divoom Cloud.
+# ============================================================================
+
+class PixelBean(object):
+    def __init__(self, total_frames, speed, row_count, column_count, frames_data):
+        self._total_frames = total_frames
+        self._speed = speed
+        self._row_count = row_count
+        self._column_count = column_count
+        self._frames_data = frames_data # List of numpy arrays
+        self._width = column_count * 16
+        self._height = row_count * 16
+
+    @property
+    def total_frames(self): return self._total_frames
+    @property
+    def speed(self): return self._speed
+    @property
+    def width(self): return self._width
+    @property
+    def height(self): return self._height
+
+    def get_frame_image(self, frame_number):
+        if frame_number <= 0 or frame_number > self._total_frames:
+            raise Exception('Frame number out of range!')
+        frame_array = self._frames_data[frame_number - 1]
+        img = Image.fromarray(frame_array.astype(np.uint8), 'RGB')
+        return img
+
+class FileFormat(Enum):
+    PIC_MULTIPLE = 17
+    ANIM_SINGLE = 9  
+    ANIM_MULTIPLE = 18  
+    ANIM_MULTIPLE_64 = 26
+
+class BaseDecoder(object):
+    AES_SECRET_KEY = '78hrey23y28ogs89'
+    AES_IV = '1234567890123456'.encode('utf8')
+
+    def __init__(self, fp):
+        self._fp = fp
+        try:
+            self._lzo = lzallright.LZOCompressor()
+        except:
+            self._lzo = None
+
+    def _decrypt_aes(self, data):
+        cipher = AES.new(self.AES_SECRET_KEY.encode('utf8'), AES.MODE_CBC, self.AES_IV)
+        return cipher.decrypt(data)
+
+    def _compact(self, frames_data, total_frames, row_count=1, column_count=1):
+        frame_size = row_count * column_count * 16 * 16 * 3
+        width = column_count * 16
+        height = row_count * 16
+        frames_arrays = []
+
+        for frame_data in frames_data:
+            frame_array = np.zeros((height, width, 3), dtype=np.uint8)
+            pos = 0
+            x, y, grid_x, grid_y = 0, 0, 0, 0
+
+            while pos < frame_size and pos + 3 <= len(frame_data):
+                r, g, b = unpack('BBB', frame_data[pos : pos + 3])
+                real_x = x + (grid_x * 16)
+                real_y = y + (grid_y * 16)
+                if real_y < height and real_x < width:
+                    frame_array[real_y, real_x] = [r, g, b]
+
+                x += 1
+                pos += 3
+                if (pos // 3) % 16 == 0:
+                    x = 0; y += 1
+                if (pos // 3) % 256 == 0:
+                    x = 0; y = 0; grid_x += 1
+                    if grid_x == row_count:
+                        grid_x = 0; grid_y += 1
+            frames_arrays.append(frame_array)
+        return frames_arrays
+
+class AnimSingleDecoder(BaseDecoder):
+    def decode(self):
+        content = b'\x00' + self._fp.read()
+        encrypted_data = bytearray(len(content) - 4)
+        for i in range(len(content)):
+            if i - 4 >= 0: encrypted_data[i - 4] = content[i]
+
+        speed = unpack('>H', content[2:4])[0]
+        decrypted_data = self._decrypt_aes(encrypted_data)
+        total_frames = len(decrypted_data) // 768
+        frames_data = [decrypted_data[i*768 : (i+1)*768] for i in range(total_frames)]
+        return PixelBean(total_frames, speed, 1, 1, self._compact(frames_data, total_frames))
+
+class AnimMultiDecoder(BaseDecoder):
+    def decode(self):
+        total_frames, speed, row_count, column_count = unpack('>BHBB', self._fp.read(5))
+        encrypted_data = self._fp.read()
+        data = self._decrypt_aes(encrypted_data)
+        width = 16 * column_count; height = 16 * row_count
+        uncompressed_frame_size = width * height * 3
+        pos = 0
+        frames_data = []
+        for _ in range(total_frames):
+            frame_size = unpack('>I', data[pos : pos + 4])[0]
+            pos += 4
+            if self._lzo:
+                frame_data = self._lzo.decompress(data[pos : pos + frame_size], uncompressed_frame_size)
+            else:
+                 raise Exception("LZO library missing (pip install lzallright)")
+            pos += frame_size
+            frames_data.append(frame_data)
+        return PixelBean(total_frames, speed, row_count, column_count, self._compact(frames_data, total_frames, row_count, column_count))
+
+class PicMultiDecoder(BaseDecoder):
+    def decode(self):
+        row_count, column_count, length = unpack('>BBI', self._fp.read(6))
+        encrypted_data = self._fp.read()
+        width = 16 * column_count; height = 16 * row_count
+        uncompressed_frame_size = width * height * 3
+        data = self._decrypt_aes(encrypted_data)
+        if self._lzo:
+            frame_data = self._lzo.decompress(data[:length], uncompressed_frame_size)
+        else:
+             raise Exception("LZO library missing (pip install lzallright)")
+        return PixelBean(1, 40, row_count, column_count, self._compact([frame_data], 1, row_count, column_count))
+
+class AnimMulti64Decoder(BaseDecoder):
+    """Decoder for 64x64 0x0C Format 26."""
+    def _get_dot_info(self, data, pos, pixel_idx, bVar9):
+        if not data[pos:]: return -1
+        uVar2 = bVar9 * pixel_idx & 7
+        uVar4 = bVar9 * pixel_idx * 65536 >> 0x13
+        if bVar9 < 9:
+            uVar3 = bVar9 + uVar2
+            if uVar3 < 9:
+                uVar6 = data[pos + uVar4] << (8 - uVar3 & 0xFF) & 0xFF
+                uVar6 >>= uVar2 + (8 - uVar3) & 0xFF
+            else:
+                uVar6 = data[pos + uVar4 + 1] << (0x10 - uVar3 & 0xFF) & 0xFF
+                uVar6 >>= 0x10 - uVar3 & 0xFF
+                uVar6 &= 0xFFFF
+                uVar6 <<= 8 - uVar2 & 0xFF
+                uVar6 |= data[pos + uVar4] >> uVar2
+        else: return -1
+        return uVar6
+
+    def _decode_frame_data(self, data):
+        output = [0] * 12288
+        encrypt_type = data[5]
+        if encrypt_type != 0x0C: return bytearray(output)
+
+        uVar13 = data[6]; iVar11 = uVar13 * 3
+        if uVar13 == 0: bVar9 = 8; iVar11 = 768
+        else:
+            bVar9 = 0xFF; bVar15 = 1
+            while True:
+                if (uVar13 & 1) != 0:
+                    bVar18 = bVar9 == 0xFF
+                    bVar9 = bVar15
+                    if bVar18: bVar9 = bVar15 - 1
+                uVar14 = uVar13 & 0xFFFE
+                bVar15 = bVar15 + 1
+                uVar13 = uVar14 >> 1
+                if uVar14 == 0: break
+
+        pixel_idx = 0
+        pos = (iVar11 + 8) & 0xFFFF
+        while True:
+            color_index = self._get_dot_info(data, pos, pixel_idx & 0xFFFF, bVar9)
+            target_pos = pixel_idx * 3
+            if color_index != -1:
+                color_pos = 8 + color_index * 3
+                if color_pos + 2 < len(data):
+                    output[target_pos] = data[color_pos]
+                    output[target_pos + 1] = data[color_pos + 1]
+                    output[target_pos + 2] = data[color_pos + 2]
+            pixel_idx += 1
+            if pixel_idx == 4096: break
+        return bytearray(output)
+
+    def decode(self):
+        total_frames, speed, row_count, column_count = unpack('>BHBB', self._fp.read(5))
+        frames_data = []
+        for frame in range(total_frames):
+            size_bytes = self._fp.read(4)
+            if not size_bytes: break
+            size = unpack('>I', size_bytes)[0]
+            frame_data = self._decode_frame_data(self._fp.read(size))
+            frames_data.append(frame_data)
+        return PixelBean(total_frames, speed, row_count, column_count, self._compact(frames_data, total_frames, row_count, column_count))
+
+class PixelBeanDecoder(object):
+    @staticmethod
+    def decode_stream(fp):
+        if not DIVOOM_DECODER_SUPPORT: return None
+        try:
+            file_format_byte = fp.read(1)
+            if not file_format_byte: return None
+            file_format = unpack('B', file_format_byte)[0]
+            try:
+                fmt = FileFormat(file_format)
+            except ValueError:
+                logging.warning(f"Unsupported file format ID: {file_format}")
+                return None
+
+            if fmt == FileFormat.ANIM_SINGLE: return AnimSingleDecoder(fp).decode()
+            elif fmt == FileFormat.ANIM_MULTIPLE: return AnimMultiDecoder(fp).decode()
+            elif fmt == FileFormat.PIC_MULTIPLE: return PicMultiDecoder(fp).decode()
+            elif fmt == FileFormat.ANIM_MULTIPLE_64:
+                 # Read header peek to decide if 64x64 (0x0C)
+                 header = fp.read(5)
+                 if len(header) < 5: return None
+                 total, speed, row, col = unpack('>BHBB', header)
+                 # Rewind header
+                 remaining = fp.read()
+                 new_fp = io.BytesIO(header + remaining)
+                 # If 64x64 (row=4, col=4), use special decoder
+                 if row == 4 and col == 4:
+                     return AnimMulti64Decoder(new_fp).decode()
+                 return None # Other 64 formats not implemented in minimal merge
+            else:
+                logging.warning(f"Decoder for format {fmt} not fully implemented.")
+                return None
+        except Exception as e:
+            logging.error(f"Decoding error: {e}")
+            return None
+
+# ============================================================================
+# Configuration Management
+# ============================================================================
 
 def load_config():
-    global rss_feed_urls, calendar_urls, spotify_refresh_token
+    global rss_feed_urls, calendar_urls, spotify_refresh_token, DIV_LOGIN_EMAIL, DIV_LOGIN_PASSWORD
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             config_data = json.load(f)
             rss_feed_urls = config_data.get('rss_feeds', [])
             calendar_urls = config_data.get('calendar_urls', [])
-            # Load Spotify specific config
             spotify_refresh_token = config_data.get('spotify_refresh_token', None)
-            DEFAULT_SPOTIFY_CLIENT_SECRET = config_data.get('spotify_client_secret', '')
+            DIV_LOGIN_EMAIL = config_data.get('divoom_email', '')
+            DIV_LOGIN_PASSWORD = config_data.get('divoom_password', '')
+            
             return config_data
     return {}
 
 def save_config(data):
-    global spotify_refresh_token
-    data['rss_feeds'] = rss_feed_urls
-    data['calendar_urls'] = calendar_urls
-    # Save Spotify specific config
-    if app and hasattr(app, 'spotify_client_id_entry'):
-        data['spotify_client_id'] = app.spotify_client_id_entry.get()
-        data['spotify_client_secret'] = app.spotify_client_secret_entry.get()
-    data['spotify_refresh_token'] = spotify_refresh_token
-
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(data, f, indent=4)
+        global spotify_refresh_token
+        data['rss_feeds'] = rss_feed_urls
+        data['calendar_urls'] = calendar_urls
+        if app and hasattr(app, 'spotify_client_id_entry'):
+            data['spotify_client_id'] = app.spotify_client_id_entry.get()
+            data['spotify_client_secret'] = app.spotify_client_secret_entry.get()
+        data['spotify_refresh_token'] = spotify_refresh_token
+        data['divoom_email'] = DIV_LOGIN_EMAIL
+        data['divoom_password'] = DIV_LOGIN_PASSWORD
+    
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
 
 app_config = load_config()
 DEFAULT_PIXOO_IP = app_config.get('ip_address', '')
@@ -181,18 +444,22 @@ def stop_all_activity():
     time.sleep(0.1)
 
 def connect_to_pixoo(ip_address: str) -> bool:
-    global pixoo
+    global pixoo_stream, pixoo_upload
     try:
         logging.info(f"Connecting to Pixoo at IP: {ip_address}")
         stop_all_activity()
-        new_pixoo = Pixoo(ip_address)
-        logging.info("Successfully connected to Pixoo.")
-        pixoo = new_pixoo
+
+        pixoo_stream = PixooStream(ip_address)
+        pixoo_upload = PixooUpload(ip_address) 
+
+        logging.info("Successfully connected both streaming and upload clients.")
         app_config['ip_address'] = ip_address
         save_config(app_config)
         return True
     except Exception as e:
-        logging.error(f"Failed to connect to Pixoo: {e}")
+        logging.error(f"Failed to connect one or both Pixoo clients: {e}")
+        pixoo_stream = None
+        pixoo_upload = None
         return False
 
 def draw_grid(image):
@@ -244,7 +511,7 @@ def refresh_preview():
 
 def screen_capture_task():
     while streaming.is_set():
-        if pixoo is None: time.sleep(0.5); continue
+        if pixoo_stream is None: time.sleep(0.5); continue
         try:
             bbox = None
             if app.use_region_var.get():
@@ -254,7 +521,7 @@ def screen_capture_task():
                 except ValueError: logging.warning("Invalid screen region. Using full screen.")
             screenshot = ImageGrab.grab(bbox=bbox)
             processed = process_image(screenshot)
-            pixoo.draw_image(processed); pixoo.push()
+            pixoo_stream.draw_image(processed); pixoo_stream.push()
             update_preview_label(processed)
         except Exception as e:
             logging.error(f"Error during screen capture: {e}"); streaming.clear(); break
@@ -266,7 +533,7 @@ def advanced_sysmon_task(options):
     last_time = time.time()
 
     while sysmon_active.is_set():
-        if pixoo is None: time.sleep(1); continue
+        if pixoo_stream is None: time.sleep(1); continue
 
         stats = {}
         if options["cpu_total"] or options["cpu_cores"]:
@@ -305,7 +572,7 @@ def advanced_sysmon_task(options):
             img = Image.new('RGB', (64, 64), 'black')
             draw_sysmon_dashboard(img, stats, tiny_font)
 
-            pixoo.draw_image(img); pixoo.push()
+            pixoo_stream.draw_image(img); pixoo_stream.push()
             update_preview_label(img)
         except Exception as e:
             logging.error(f"Error in system monitor: {e}"); sysmon_active.clear(); break
@@ -365,8 +632,8 @@ def play_video_for_duration(video_path, duration_s):
                 pil_image = Image.fromarray(frame_rgb)
 
                 processed = process_image(pil_image)
-                if pixoo:
-                    pixoo.draw_image(processed); pixoo.push()
+                if pixoo_stream:
+                    pixoo_stream.draw_image(processed); pixoo_stream.push()
                 update_preview_label(processed)
 
                 next_frame_time += frame_delay
@@ -379,49 +646,6 @@ def play_video_for_duration(video_path, duration_s):
         cap.release()
     except Exception as e:
         logging.error(f"Error during playlist video playback '{video_path}': {e}")
-        playlist_active.wait(2)
-
-def play_gif_for_duration(gif_path, duration_s):
-    start_time = time.monotonic()
-
-    try:
-        with Image.open(gif_path) as gif:
-            frames = []
-            for frame_image in ImageSequence.Iterator(gif):
-                frame_duration = frame_image.info.get('duration', 100) / 1000.0
-                converted_frame = frame_image.convert("RGB")
-                processed_frame = process_image(converted_frame)
-                frames.append({'image': processed_frame, 'duration': frame_duration})
-
-            if not frames:
-                logging.warning(f"Could not load frames for GIF: {gif_path}")
-                return
-
-            MIN_FRAME_DELAY_S = 0.02
-            next_frame_time = time.monotonic()
-
-            while time.monotonic() - start_time < duration_s:
-                if not playlist_active.is_set(): break
-
-                for frame_data in frames:
-                    if not playlist_active.is_set() or time.monotonic() - start_time >= duration_s:
-                        break
-
-                    wait_time = next_frame_time - time.monotonic()
-                    if wait_time > 0: time.sleep(wait_time)
-
-                    if pixoo is None:
-                        playlist_active.wait(0.5)
-                        continue
-
-                    frame_to_show = frame_data['image']
-                    pixoo.draw_image(frame_to_show); pixoo.push()
-                    update_preview_label(frame_to_show)
-
-                    next_frame_time += max(frame_data['duration'], MIN_FRAME_DELAY_S)
-
-    except Exception as e:
-        logging.error(f"Could not play playlist GIF '{gif_path}': {e}")
         playlist_active.wait(2)
 
 def playlist_task(interval_s, shuffle):
@@ -437,29 +661,55 @@ def playlist_task(interval_s, shuffle):
 
         for item_path in playlist_copy:
             if not playlist_active.is_set(): break
+            if pixoo_upload is None:
+                logging.error("Pixoo (upload) not connected. Stopping playlist.")
+                playlist_active.clear()
+                break
 
             file_ext = os.path.splitext(item_path)[1].lower()
 
-            if file_ext == '.gif':
-                logging.info(f"Playing GIF from playlist: {item_path} for {interval_s}s")
-                play_gif_for_duration(item_path, interval_s)
-            elif file_ext in ['.mp4', '.mkv', '.avi', '.mov']:
-                logging.info(f"Playing video from playlist: {item_path} for {interval_s}s")
-                play_video_for_duration(item_path, interval_s)
-            else:
-                logging.info(f"Displaying image from playlist: {item_path} for {interval_s}s")
-                try:
+            try:
+                if file_ext == '.gif':
+                    logging.info(f"Uploading GIF from playlist: {item_path}")
+                    frames = []
+                    durations = []
+                    with Image.open(item_path) as gif:
+                        for frame_image in ImageSequence.Iterator(gif):
+                            durations.append(frame_image.info.get('duration', 100))
+                            processed_frame = process_image(frame_image.convert("RGB"))
+                            frames.append(processed_frame)
+
+                    if not frames:
+                        logging.warning(f"Could not load frames for GIF: {item_path}")
+                        continue # Skip this item
+
+                    avg_duration = max(30, int(sum(durations) / len(durations)) if durations else 100)
+                    
+                    # Upload the GIF to the device
+                    pixoo_upload.send_images(frames, speed=avg_duration)
+                    update_preview_label(frames[0])
+
+                elif file_ext in ['.mp4', '.mkv', '.avi', '.mov']:
+                    logging.info(f"Playing video from playlist: {item_path} for {interval_s}s")
+                    play_video_for_duration(item_path, interval_s)
+                    
+                    continue 
+
+                else: # Static Image
+                    logging.info(f"Displaying image from playlist: {item_path} for {interval_s}s")
                     image = Image.open(item_path).convert("RGB")
                     processed = process_image(image)
-                    pixoo.draw_image(processed); pixoo.push()
+                    pixoo_upload.send_image(processed)
                     update_preview_label(processed)
-                    # Wait for the interval duration, checking the event frequently
-                    for _ in range(interval_s * 4): # Check 4 times a second
-                        if not playlist_active.is_set(): break
-                        time.sleep(0.25)
-                except Exception as e:
-                    logging.error(f"Error cycling image '{item_path}': {e}")
-                    playlist_active.wait(2)
+
+                # Wait for the interval (only for GIFs and Images)
+                for _ in range(interval_s * 4): # Check 4 times a second
+                    if not playlist_active.is_set(): break
+                    time.sleep(0.25)
+
+            except Exception as e:
+                logging.error(f"Error processing playlist item '{item_path}': {e}")
+                playlist_active.wait(2) # Wait 2s on error
 
         if not playlist_active.is_set(): break
 
@@ -474,51 +724,41 @@ def standalone_gif_task():
     app.gif_path_label.configure(text="Processing, please wait...")
 
     try:
+        frames = []
+        durations = []
         with Image.open(current_gif_path) as gif:
-            frames = []
             for frame_image in ImageSequence.Iterator(gif):
-                frame_duration = frame_image.info.get('duration', 100) / 1000.0
+                # Get duration
+                duration = frame_image.info.get('duration', 100)
+                durations.append(duration)
+                
+                # Process frame
                 converted_frame = frame_image.convert("RGB")
                 processed_frame = process_image(converted_frame)
-                frames.append({'image': processed_frame, 'duration': frame_duration})
+                frames.append(processed_frame)
 
         if not frames:
             messagebox.showerror("GIF Error", "Could not load any frames from the GIF.")
-            app.gif_path_label.configure(text="GIF processing failed.")
-            app.toggle_processing_controls(enabled=True)
-            gif_active.clear()
             return
 
+        # Use the average duration for the 'speed' parameter
+        avg_duration = sum(durations) / len(durations) if durations else 100
+        avg_duration = max(30, int(avg_duration)) # Ensure a minimum delay
+
+        app.gif_path_label.configure(text=f"Uploading: {os.path.basename(current_gif_path)}...")
+        
+        # Upload the list of frames as an animation
+        pixoo_upload.send_images(frames, speed=avg_duration)
+        
         app.gif_path_label.configure(text=f"Playing: {os.path.basename(current_gif_path)}")
-
-        MIN_FRAME_DELAY_S = 0.02
-        next_frame_time = time.monotonic()
-
-        while gif_active.is_set():
-            for frame_data in frames:
-                if not gif_active.is_set(): break
-                if pixoo is None:
-                    gif_active.wait(0.5)
-                    continue
-
-                wait_time = next_frame_time - time.monotonic()
-                if wait_time > 0: time.sleep(wait_time)
-
-                frame_image = frame_data['image']
-                pixoo.draw_image(frame_image); pixoo.push()
-                update_preview_label(frame_image)
-
-                next_frame_time += max(frame_data['duration'], MIN_FRAME_DELAY_S)
-
-            if not gif_active.is_set(): break
+        gif_active.set() # Set the flag so "STOP ALL" works
 
     except Exception as e:
         messagebox.showerror("GIF Error", f"Could not process or play GIF: {e}")
-    finally:
         app.gif_path_label.configure(text=f"Selected: {os.path.basename(current_gif_path)}")
+    finally:
         app.toggle_processing_controls(enabled=True)
-        gif_active.clear()
-        logging.info("GIF playback finished.")
+        logging.info("GIF playback (upload) finished.")
 
 def video_playback_task():
     if not current_video_path: return
@@ -546,9 +786,9 @@ def video_playback_task():
                 pil_image = Image.fromarray(frame_rgb)
 
                 processed = process_image(pil_image)
-                if pixoo:
-                    pixoo.draw_image(processed)
-                    pixoo.push()
+                if pixoo_stream:
+                    pixoo_stream.draw_image(processed)
+                    pixoo_stream.push()
                 update_preview_label(processed)
 
                 next_frame_time += frame_delay
@@ -609,7 +849,7 @@ def scrolling_text_task(text_to_scroll, font_size, delay_ms, active_event):
             while active_event.is_set():
                 frame = Image.new('RGB', (64, 64), (0,0,0))
                 frame.paste(full_text_image, (x_pos, y), full_text_image)
-                if pixoo: pixoo.draw_image(frame); pixoo.push()
+                if pixoo_stream: pixoo_stream.draw_image(frame); pixoo_stream.push()
                 update_preview_label(frame)
 
                 y -= 1
@@ -644,7 +884,7 @@ def rss_task(delay_between_headlines, scroll_speed_ms):
     while rss_active.is_set():
         if not rss_feed_urls:
             logging.warning("RSS feed list is empty, stopping.")
-            messagebox.showwarning("Empty", "Your RSS feed list is empty.")
+            messagebox.showwarning("Empty", "Please add at least one RSS feed URL.")
             break
 
         logging.info("Starting new RSS feed cycle.")
@@ -680,10 +920,6 @@ def rss_task(delay_between_headlines, scroll_speed_ms):
     logging.info("RSS Feed task stopped.")
 
 def calendar_task(scroll_speed_ms, refresh_interval_minutes):
-    """
-    This function has been completely rewritten to provide a static header
-    and independently scrolling lines for calendar events, per user request.
-    """
     try:
         font_events = ImageFont.truetype("arial.ttf", 10)
         font_header = ImageFont.truetype("arialbd.ttf", 10)
@@ -693,19 +929,17 @@ def calendar_task(scroll_speed_ms, refresh_interval_minutes):
 
     last_refresh_time = 0
     events_today_data = []
-    scroll_states = {} # Stores {'text': str, 'width': int, 'offset': int, 'pause': int} for each line
+    scroll_states = {} 
 
-    PAUSE_DURATION_FRAMES = 90 # How long to pause at the start/end of a scroll (e.g., 90 frames = 3s at 30fps)
+    PAUSE_DURATION_FRAMES = 90 
 
     while calendar_active.is_set():
         current_time = time.monotonic()
 
-        # --- 1. Data Fetching and Processing ---
         if not events_today_data or (current_time - last_refresh_time > refresh_interval_minutes * 60):
             logging.info("Refreshing calendar data...")
             last_refresh_time = current_time
             
-            # Reset state for new data
             events_today_data.clear()
             scroll_states.clear()
 
@@ -746,14 +980,13 @@ def calendar_task(scroll_speed_ms, refresh_interval_minutes):
             all_events.sort(key=lambda x: x['start'])
             events_today_data = all_events
             
-            # Initialize scroll states for the new events
             for i, event in enumerate(events_today_data):
                 if event['all_day']:
                     time_str = "All-Day"
                 else:
                     local_tz = datetime.now().astimezone().tzinfo
                     local_time = event['start'].astimezone(local_tz)
-                    time_str = local_time.strftime('%I:%M%p') # e.g., 03:30PM
+                    time_str = local_time.strftime('%I:%M%p') 
                 
                 full_text = f"{time_str} {event['summary']}"
                 text_width = font_events.getbbox(full_text)[2]
@@ -762,22 +995,19 @@ def calendar_task(scroll_speed_ms, refresh_interval_minutes):
                     'text': full_text,
                     'width': text_width,
                     'offset': 0,
-                    'pause': PAUSE_DURATION_FRAMES # Start with a pause
+                    'pause': PAUSE_DURATION_FRAMES 
                 }
 
 
-        # --- 2. Drawing ---
         img = Image.new('RGB', (64, 64), 'black')
         draw = ImageDraw.Draw(img)
 
-        # Draw Header
-        header_text = datetime.now().strftime("%a, %b %d").upper() # e.g., SAT, AUG 16
+        header_text = datetime.now().strftime("%a, %b %d").upper() 
         header_width = font_header.getbbox(header_text)[2]
         draw.rectangle([0, 0, 63, 11], fill=(40, 40, 40))
         draw.line([0, 11, 63, 11], fill=(80, 80, 80))
         draw.text(((64 - header_width) / 2, 1), header_text, font=font_header, fill=(200, 200, 255))
 
-        # Draw Event Lines
         y_pos = 14
         for i, event in enumerate(events_today_data):
             if y_pos > 60: break
@@ -785,43 +1015,35 @@ def calendar_task(scroll_speed_ms, refresh_interval_minutes):
             state = scroll_states.get(i)
             if not state: continue
 
-            # If text fits, just draw it statically
             if state['width'] <= 64:
                 draw.text((1, y_pos), state['text'], font=font_events, fill="white")
-            # Otherwise, handle scrolling logic
             else:
-                # If paused, don't increment offset
                 if state['pause'] > 0:
                     state['pause'] -= 1
                 else:
                     state['offset'] += 1
                 
-                # Create a surface for the full text to scroll
                 text_surface = Image.new('RGB', (state['width'], 10), 'black')
                 text_draw = ImageDraw.Draw(text_surface)
                 text_draw.text((0, 0), state['text'], font=font_events, fill="white")
                 
-                # If scrolled past the end, loop back with a pause
-                if state['offset'] > state['width'] - 64 + 30: # +30 adds a tail pause
+                if state['offset'] > state['width'] - 64 + 30: 
                     state['offset'] = 0
                     state['pause'] = PAUSE_DURATION_FRAMES
 
-                # Crop the visible part and paste it onto the main image
                 scroll_box = (state['offset'], 0, state['offset'] + 64, 10)
                 img.paste(text_surface.crop(scroll_box), (0, y_pos))
 
             y_pos += 12
 
-        # --- 3. Push to Device & Preview ---
         try:
-            if pixoo:
-                pixoo.draw_image(img)
-                pixoo.push()
+            if pixoo_stream:
+                pixoo_stream.draw_image(img)
+                pixoo_stream.push()
             update_preview_label(img)
         except Exception as e:
             logging.error(f"Failed to push calendar frame to Pixoo: {e}")
 
-        # --- 4. Animation Delay ---
         calendar_active.wait(scroll_speed_ms / 1000.0)
     
     logging.info("Calendar task stopped.")
@@ -836,7 +1058,7 @@ def equalizer_task(device_id, effect):
     try:
         with sc.get_microphone(id=device_id, include_loopback=True).recorder(samplerate=44100) as mic:
             while equalizer_active.is_set():
-                if pixoo is None: time.sleep(0.1); continue
+                if pixoo_stream is None: time.sleep(0.1); continue
 
                 data = mic.record(numframes=2048)
                 if data is None or len(data) == 0: continue
@@ -851,7 +1073,7 @@ def equalizer_task(device_id, effect):
                 else:
                     img = Image.new('RGB', (64, 64), (0,0,0))
 
-                pixoo.draw_image(img); pixoo.push()
+                pixoo_stream.draw_image(img); pixoo_stream.push()
                 update_preview_label(img)
     except Exception as e:
         logging.error(f"Audio visualizer failed: {e}")
@@ -929,6 +1151,311 @@ def draw_vortex(data):
     vortex_particles = new_particles
     return img
 
+
+# --- Divoom Cloud Functions ---
+
+def divoom_cloud_login(email: str, password: str) -> bool:
+    global DIV_USER_ID, DIV_TOKEN, DIV_LOGIN_EMAIL, DIV_LOGIN_PASSWORD
+    DIV_LOGIN_EMAIL = email
+    DIV_LOGIN_PASSWORD = password
+    
+    login_url = f"{DIV_BASE_URL}/User/UserLogin"
+    password_md5 = hashlib.md5(password.encode('utf-8')).hexdigest()
+    
+    payload = {"Email": email, "Password": password_md5}
+    headers = {'User-Agent': 'Aurabox/3.1.10 (iPad; iOS 14.8; Scale/2.00)'}
+
+    try:
+        logging.info(f"Attempting Divoom login for {email}")
+        r = requests.post(login_url, json=payload, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("ReturnCode") == 0:
+            DIV_USER_ID = str(data.get("UserId", "0"))
+            DIV_TOKEN = data.get("Token", "") # Session Token
+            logging.info(f"Divoom Cloud Login successful for UserID: {DIV_USER_ID}")
+            return True
+        else:
+            logging.error(f"Divoom Login failed: {data.get('ReturnMessage')}")
+            return False
+
+    except Exception as e:
+        logging.error(f"Divoom Cloud connection failed: {e}")
+        return False
+
+def fetch_cloud_gallery_list(page=1, per_page=24, sort_type=0, file_size=0):
+    global DIV_USER_ID, DIV_TOKEN
+    
+    url = f"{DIV_BASE_URL}/GetCategoryFileListV2"
+
+    start_num = ((page - 1) * per_page) + 1
+    end_num = start_num + per_page - 1
+    
+    size_val = str(file_size) if file_size > 0 else "63"
+
+    payload = {
+        "StartNum": str(start_num), "EndNum": str(end_num), 
+        "Classify": "18", "FileType": "5", "FileSort": str(sort_type), 
+        "FileSize": size_val,
+        "Version": "12", "RefreshIndex": "0",
+        "UserId": DIV_USER_ID, "Token": DIV_TOKEN
+    }
+    
+    headers = {'User-Agent': 'Aurabox/3.1.10 (iPad; iOS 14.8; Scale/2.00)'}
+    try:
+        logging.info(f"Fetching Page {page} (Start:{start_num}-End:{end_num})...")
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
+        data = r.json()
+        
+        if data.get("ReturnCode") == 0:
+            file_list = data.get("FileList", [])
+            
+            if len(file_list) >= per_page:
+                total_pages = page + 1 
+            else:
+                # Less than 24 items means we reached the end.
+                total_pages = page
+            
+            return file_list, total_pages
+        else:
+            logging.error(f"API Error: {data.get('ReturnMessage')}")
+            return [], 1
+    except Exception as e:
+        logging.error(f"Fetch error: {e}")
+        return [], 1
+
+def download_and_decode_pixel_bean(file_id):
+    url = f"{DIV_FILE_URL}/{file_id}"
+    try:
+        resp = requests.get(url, timeout=15, stream=True) 
+        if resp.status_code == 200:
+            fp = io.BytesIO(resp.content)
+            # Attempt to decode using the integrated decoder
+            pixel_bean = PixelBeanDecoder.decode_stream(fp)
+            return pixel_bean
+        else:
+            logging.error(f"Download failed for ID {file_id}: {resp.status_code}")
+            return None
+    except Exception as e:
+        logging.error(f"Error downloading/decoding ID {file_id}: {e}")
+        return None
+
+def display_cloud_artwork_task(file_id, filename):
+    stop_all_activity()
+    app.gallery_status_label.configure(text=f"Status: Switching to '{filename}'...")
+    
+    time.sleep(0.5)
+    
+    app.gallery_status_label.configure(text=f"Status: Downloading '{filename}'...")
+    
+    # Download
+    pixel_bean = download_and_decode_pixel_bean(file_id)
+    
+    if pixel_bean and pixoo_upload:
+        try:
+            total = pixel_bean.total_frames
+            app.gallery_status_label.configure(text=f"Status: Processing {total} frames...")
+            
+            # 4. Decode all frames into a list
+            frames = []
+            needs_resize = (pixel_bean.width != 64) or (pixel_bean.height != 64)
+            for i in range(1, total + 1):
+                img = pixel_bean.get_frame_image(i).convert("RGB")
+                if needs_resize:
+                    frames.append(img.resize((64, 64), Image.Resampling.NEAREST))
+                else:
+                    frames.append(img)
+            
+            if not frames:
+                app.gallery_status_label.configure(text="Status: No frames decoded.", text_color="red")
+                return
+
+            # 5. Set the active flag and upload the animation
+            gif_active.set() 
+            
+            if total > 1:
+                # Animation: Use send_images()
+                frame_duration_ms = max(30, pixel_bean.speed) # Divoom speed is in ms
+                
+                app.gallery_status_label.configure(text=f"Status: Uploading {total} frames...")
+                pixoo_upload.send_images(frames, speed=frame_duration_ms)
+                app.gallery_status_label.configure(text=f"Status: Playing '{filename}'")
+                
+            else:
+                # Static Image: Use send_image()
+                pixoo_upload.send_image(frames[0])
+                app.gallery_status_label.configure(text=f"Status: Displaying '{filename}'")
+            
+            # Update the local preview with the first frame
+            update_preview_label(frames[0])
+                
+        except Exception as e:
+            logging.error(f"Display error: {e}")
+            app.gallery_status_label.configure(text="Status: Error displaying image.", text_color="red")
+    else:
+        app.gallery_status_label.configure(text="Status: Download/Decode Failed.", text_color="red")
+        
+def fetch_artwork_comments(gallery_id):
+    """Fetches all comments for a given gallery ID."""
+    global DIV_USER_ID, DIV_TOKEN
+    if not DIV_TOKEN or DIV_USER_ID == "0":
+        return ["Please log in to fetch comments."]
+
+    all_comments = []
+    page = 1
+    per_page = 20
+    
+    while True:
+        start_num = ((page - 1) * per_page) + 1
+        end_num = start_num + per_page - 1
+
+        payload = {
+            "StartNum": str(start_num),
+            "EndNum": str(end_num),
+            "GalleryId": str(gallery_id),
+            "Token": DIV_TOKEN,
+            "UserId": DIV_USER_ID
+        }
+        
+        try:
+            r = requests.post(DIV_GET_COMMENTS_ENDPOINT, json=payload, headers={'User-Agent': 'Aurabox/3.1.10'}, timeout=10)
+            data = r.json()
+
+            if data.get("ReturnCode") == 0:
+                comment_list = data.get("CommentList", [])
+                if not comment_list:
+                    break  # No more comments
+                
+                for comment in comment_list:
+                    user = comment.get("UserName", "User")
+                    text = comment.get("Content", "")
+                    all_comments.append(f"{user}:\n{text}")
+                
+                page += 1
+            else:
+                logging.error(f"Failed to fetch comments: {data.get('ReturnMessage')}")
+                break
+        except Exception as e:
+            logging.error(f"Error fetching comments: {e}")
+            return [f"Error fetching comments: {e}"]
+
+    if not all_comments:
+        return ["No comments found."]
+        
+    return all_comments
+    
+def fetch_artwork_likes(self, gallery_id):
+        """Fetches all users who liked a given gallery ID."""
+        global DIV_USER_ID, DIV_TOKEN
+        if not DIV_TOKEN or DIV_USER_ID == "0":
+            return ["Please log in to fetch likes."]
+
+        all_likes = []
+        page = 1
+        per_page = 20
+        
+        LIKES_ENDPOINT = "https://app.divoom-gz.com/Cloud/GetLikeUserList"
+
+        while True:
+            start_num = ((page - 1) * per_page) + 1
+            end_num = start_num + per_page - 1
+
+            payload = {
+                "StartNum": str(start_num),
+                "EndNum": str(end_num),
+                "GalleryId": str(gallery_id),
+                "Token": DIV_TOKEN,
+                "UserId": DIV_USER_ID
+            }
+            
+            try:
+                r = requests.post(LIKES_ENDPOINT, json=payload, headers={'User-Agent': 'Aurabox/3.1.10'}, timeout=10)
+                data = r.json()
+
+                if data.get("ReturnCode") == 0:
+                    user_list = data.get("UserList", [])
+                    if not user_list:
+                        break  # No more likes
+                    
+                    for user in user_list:
+                        user_name = user.get("UserName", "User")
+                        level = user.get("Level", 0)
+                        all_likes.append(f"• {user_name} (Level {level})")
+                    
+                    page += 1
+                else:
+                    logging.error(f"Failed to fetch likes: {data.get('ReturnMessage')}")
+                    break
+            except Exception as e:
+                logging.error(f"Error fetching likes: {e}")
+                return [f"Error fetching likes: {e}"]
+
+        if not all_likes:
+            return ["No likes found."]
+            
+        return all_likes
+
+def _animate_gif_on_label(label_widget, frames, delay_ms):
+    """Internal helper to animate a list of PIL frames on a CTkLabel."""
+    try:
+        frame_idx = 0
+        
+        while True: # This loop will be broken when the label is destroyed
+            frame_image = frames[frame_idx]
+            
+            # Convert PIL image to PhotoImage
+            photo_image = ImageTk.PhotoImage(frame_image)
+            
+            # Update the label's image
+            # We use .after() to ensure this runs on the main GUI thread
+            label_widget.after(0, lambda w=label_widget, img=photo_image: w.configure(image=img))
+            
+            # Store a reference to avoid garbage collection
+            label_widget.image = photo_image 
+            
+            frame_idx = (frame_idx + 1) % len(frames)
+            time.sleep(delay_ms / 1000.0)
+    except Exception:
+        # This will likely fail when the Toplevel window is closed, which is fine
+        logging.info("Animation label thread stopped.")
+
+    # --- Bottom Button ---
+    display_button = customtkinter.CTkButton(details_window, text="Display on Pixoo", height=40,
+                                             command=lambda f_id=file_id, f_name=file_name: threading.Thread(target=display_cloud_artwork_task, args=(f_id, f_name), daemon=True).start())
+    display_button.grid(row=3, column=0, padx=10, pady=10, sticky="ew")
+
+    # --- BACKGROUND LOADING THREAD ---
+    def load_details_task():
+        # 1. Download and Decode .dat file
+        pixel_bean = download_and_decode_pixel_bean(file_id)
+        if pixel_bean and pixel_bean.total_frames > 1:
+            frames = []
+            for i in range(1, pixel_bean.total_frames + 1):
+                # Resize frames for the 256x256 preview label
+                img = pixel_bean.get_frame_image(i).resize((256, 256), Image.Resampling.NEAREST)
+                frames.append(img)
+            
+            # Start the animation thread
+            threading.Thread(target=_animate_gif_on_label, args=(gif_preview_label, frames, pixel_bean.speed), daemon=True).start()
+        elif pixel_bean:
+            img = pixel_bean.get_frame_image(1).resize((256, 256), Image.Resampling.NEAREST)
+            ctk_img = customtkinter.CTkImage(light_image=img, dark_image=img, size=(256, 256))
+            gif_preview_label.configure(image=ctk_img, text="")
+
+        # 2. Fetch Comments
+        comments_frame.after(0, lambda: customtkinter.CTkLabel(comments_frame, text="Loading comments...").pack(anchor="w", padx=5, pady=2))
+        comments = fetch_artwork_comments(gallery_id)
+        
+        # Clear "loading" and add comments
+        comments_frame.after(0, lambda: [widget.destroy() for widget in comments_frame.winfo_children()])
+        for comment in comments:
+            comments_frame.after(0, lambda c=comment: customtkinter.CTkLabel(comments_frame, text=c, wraplength=500, justify="left", anchor="w").pack(anchor="w", fill="x", padx=5, pady=5))
+
+    # Start the background loading
+    threading.Thread(target=load_details_task, daemon=True).start()
+
+
 def ai_image_generation_task(prompt, use_pixel_style, use_hd):
     ai_image_active.set()
     app.ai_status_label.configure(text="Status: Generating...")
@@ -954,9 +1481,8 @@ def ai_image_generation_task(prompt, use_pixel_style, use_hd):
             ai_image = Image.open(io.BytesIO(image_data))
 
             processed = process_image(ai_image)
-            if pixoo:
-                pixoo.draw_image(processed)
-                pixoo.push()
+            if pixoo_upload:
+                pixoo_upload.send_image(processed)
             update_preview_label(processed)
             app.ai_status_label.configure(text="Status: Done!")
         else:
@@ -988,9 +1514,8 @@ def webcam_slideshow_task(interval_s, shuffle):
             if not webcam_slideshow_active.is_set(): break
 
             processed = process_image(frame_image)
-            if pixoo:
-                pixoo.draw_image(processed)
-                pixoo.push()
+            if pixoo_upload:
+                pixoo_upload.send_image(processed)
             update_preview_label(processed)
 
             for _ in range(interval_s):
@@ -1000,33 +1525,6 @@ def webcam_slideshow_task(interval_s, shuffle):
         if not webcam_slideshow_active.is_set(): break
 
     logging.info("Webcam slideshow finished.")
-
-def pixel_animation_task(delay_s):
-    if not animation_frames:
-        logging.warning("Animation started with no frames.")
-        return
-
-    while pixel_animation_active.is_set():
-        for frame_image in animation_frames:
-            if not pixel_animation_active.is_set():
-                break
-            if pixoo:
-                try:
-                    pixoo.draw_image(frame_image)
-                    pixoo.push()
-                    # We can't directly call a CTk object method from this thread.
-                    # Instead, we schedule it to run on the main thread.
-                    app.after(0, app.load_image_to_canvas_data, frame_image)
-                except Exception as e:
-                    logging.error(f"Error during pixel animation: {e}")
-                    pixel_animation_active.clear()
-                    break
-
-            for _ in range(int(delay_s * 10)):
-                if not pixel_animation_active.is_set(): break
-                time.sleep(0.1)
-
-    logging.info("Pixel animation task stopped.")
 
 def get_lyrics_threaded(artist, track):
     global current_lyrics
@@ -1097,7 +1595,7 @@ def spotify_task():
                 img = Image.new('RGB', (64, 64), 'black')
                 draw = ImageDraw.Draw(img)
                 draw.text((8, 24), "Spotify\nPaused", font=spotify_font, fill="grey", align="center", spacing=2)
-                if pixoo: pixoo.draw_image(img); pixoo.push()
+                if pixoo_stream: pixoo_stream.draw_image(img); pixoo_stream.push()
                 update_preview_label(img)
                 time.sleep(2)
                 continue
@@ -1188,8 +1686,8 @@ class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Pixoo 64 Advanced Tools 2.8")
-        self.geometry("1280x720")
+        self.title("Pixoo 64 Advanced Tools 3.0")
+        self.geometry("1440x810")
 
         customtkinter.set_appearance_mode("Dark")
         customtkinter.set_default_color_theme("blue")
@@ -1204,13 +1702,18 @@ class App(customtkinter.CTk):
 
         self.navigation_frame = customtkinter.CTkFrame(self, corner_radius=0)
         self.navigation_frame.grid(row=0, column=0, sticky="nsw")
-        self.navigation_frame.grid_rowconfigure(14, weight=1)
         self.create_navigation_frame()
 
         self.content_frames = {}
         self.create_all_content_frames()
 
-        self.select_frame_by_name("image")
+        self.select_frame_by_name("credits")
+        
+        # Internal state for pagination
+        self.current_gallery_page = 1
+        self.total_gallery_pages = 1
+        self.artwork_thumbnails = {} 
+
 
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -1240,8 +1743,8 @@ class App(customtkinter.CTk):
         self.connect_button.grid(row=0, column=2, padx=(5,10), pady=10)
 
         buttons_info = {
-            "image": ("🖼️ Image/Stream", self.create_image_stream_frame),
-            "video": ("▶️ Video Player", self.create_video_frame),
+            "image": ("📷 Image/Stream", self.create_image_stream_frame),
+            "video": (" ▶ Video Player", self.create_video_frame),
             "playlist": ("⏯️ Playlist", self.create_playlist_frame),
             "text": ("✍️ Text Display", self.create_text_frame),
             "designer": ("🎨 Pixel Designer", self.create_designer_frame),
@@ -1252,11 +1755,14 @@ class App(customtkinter.CTk):
             "rss": ("📰 RSS Feeds", self.create_rss_frame),
             "spotify": ("🎵 Spotify", self.create_spotify_frame),
             "ai": ("🤖 AI Image Gen", self.create_ai_frame),
+            "gallery": ("☁️ Cloud Gallery", self.create_gallery_frame),
             "credits": ("💡 Credits", self.create_credits_frame),
         }
 
         self.nav_buttons = {}
-        for i, (name, (text, create_func)) in enumerate(buttons_info.items()):
+        # Create buttons starting at row 2
+        row_idx = 2
+        for name, (text, create_func) in buttons_info.items():
             button = customtkinter.CTkButton(self.navigation_frame,
                                              text=text,
                                              command=lambda n=name: self.select_frame_by_name(n),
@@ -1268,13 +1774,16 @@ class App(customtkinter.CTk):
                                              hover_color=("gray70", "gray30"),
                                              anchor="w",
                                              font=self.button_font)
-            button.grid(row=i + 2, column=0, sticky="ew")
+            button.grid(row=row_idx, column=0, sticky="ew")
             self.nav_buttons[name] = button
+            row_idx += 1
 
+        self.navigation_frame.grid_rowconfigure(row_idx, weight=1)
+        
         self.stop_button = customtkinter.CTkButton(self.navigation_frame, text="🛑 STOP ALL ACTIVITY",
                                                    command=stop_all_activity, fg_color="#D32F2F", hover_color="#B71C1C",
                                                    font=self.large_font)
-        self.stop_button.grid(row=16, column=0, padx=10, pady=10, sticky="s")
+        self.stop_button.grid(row=row_idx + 1, column=0, padx=10, pady=10, sticky="s")
 
 
     def create_all_content_frames(self):
@@ -1291,6 +1800,7 @@ class App(customtkinter.CTk):
             "rss": ("📰 RSS Feeds", self.create_rss_frame),
             "spotify": ("🎵 Spotify", self.create_spotify_frame),
             "ai": ("🤖 AI Image Gen", self.create_ai_frame),
+            "gallery": ("🖼️ Cloud Gallery", self.create_gallery_frame),
             "credits": ("💡 Credits", self.create_credits_frame),
         }.items():
             self.content_frames[name] = create_func()
@@ -1308,6 +1818,10 @@ class App(customtkinter.CTk):
 
         if name == 'designer' and not animation_frames:
              self.init_designer_canvas()
+        if name == 'gallery' and not self.artwork_thumbnails:
+             # Load gallery page only after successful login
+             if DIV_TOKEN and DIV_USER_ID != "0":
+                 self.load_gallery_page(1)
 
 
     def on_connect_button_click(self, silent=False):
@@ -1321,7 +1835,6 @@ class App(customtkinter.CTk):
 
     def toggle_processing_controls(self, enabled=True):
         state = "normal" if enabled else "disabled"
-        # This function seems to be for another tab, check if controls exist before configuring
         if hasattr(self, 'resize_mode_combobox'):
             self.resize_mode_combobox.configure(state=state)
             self.filter_combobox.configure(state=state)
@@ -1364,7 +1877,7 @@ class App(customtkinter.CTk):
         try:
             image = Image.open(path).convert("RGB")
             processed = process_image(image)
-            if pixoo: pixoo.draw_image(processed); pixoo.push()
+            if pixoo_upload: pixoo_upload.send_image(processed)
             update_preview_label(processed)
         except Exception as e: messagebox.showerror("Error", f"Failed to process image: {e}")
 
@@ -1551,10 +2064,15 @@ class App(customtkinter.CTk):
 
     def display_text(self):
         stop_all_activity()
-        if pixoo is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
+        if pixoo_stream is None or pixoo_upload is None: 
+            messagebox.showerror("Error", "Not connected to Pixoo."); return
+            
         text = self.text_entry.get("1.0", "end-1c")
         if not text:
-            if pixoo: pixoo.clear(); pixoo.push()
+            if pixoo_stream: 
+                # Use stream to clear
+                img = Image.new('RGB', (64, 64), (0,0,0))
+                pixoo_stream.draw_image(img); pixoo_stream.push() 
             update_preview_label(Image.new('RGB', (64,64), (0,0,0)))
             return
 
@@ -1570,11 +2088,14 @@ class App(customtkinter.CTk):
 
             img = Image.new('RGB', (64, 64), (0,0,0)); draw = ImageDraw.Draw(img)
             draw.text((x_pos, y_pos), text, font=font, fill=text_color, stroke_width=1, stroke_fill=outline_color)
-            if pixoo: pixoo.draw_image(img); pixoo.push()
+            
+            # Use upload for static image
+            if pixoo_upload: pixoo_upload.send_image(img)
             update_preview_label(img)
         else:
             self.toggle_processing_controls(enabled=False)
             text_active.set()
+            # Scrolling text uses stream
             threading.Thread(target=scrolling_text_task, args=(text, font_size, delay_ms, text_active), daemon=True).start()
 
     def populate_audio_devices(self):
@@ -1592,7 +2113,7 @@ class App(customtkinter.CTk):
 
     def start_equalizer(self):
         stop_all_activity()
-        if pixoo is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
+        if pixoo_stream is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
         device_name = self.device_listbox.get()
         if not device_name: messagebox.showwarning("No Device", "Please select an audio device first."); return
 
@@ -1833,8 +2354,8 @@ class App(customtkinter.CTk):
                 current_webcam_frame = Image.fromarray(frame_rgb)
 
                 processed = process_image(current_webcam_frame)
-                if pixoo:
-                    pixoo.draw_image(processed); pixoo.push()
+                if pixoo_stream:
+                    pixoo_stream.draw_image(processed); pixoo_stream.push()
                 update_preview_label(processed)
                 time.sleep(1/60)
 
@@ -1999,11 +2520,10 @@ class App(customtkinter.CTk):
 
     def push_canvas_to_pixoo(self):
         stop_all_activity()
-        if pixoo is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
+        if pixoo_upload is None: messagebox.showerror("Error", "Not connected to Pixoo."); return
         if current_designer_image is None: return
         try:
-            pixoo.draw_image(current_designer_image)
-            pixoo.push()
+            pixoo_upload.send_image(current_designer_image)
             logging.info("Pushed pixel design to Pixoo.")
         except Exception as e: messagebox.showerror("Error", f"Failed to push to Pixoo: {e}")
 
@@ -2126,11 +2646,36 @@ class App(customtkinter.CTk):
 
     def start_pixel_animation(self):
         stop_all_activity()
-        if not animation_frames: messagebox.showerror("Error", "No frames to animate."); return
-        try: delay = 1.0 / float(self.anim_fps_entry.get())
-        except ValueError: delay = 1.0 / 10.0
-        pixel_animation_active.set()
-        threading.Thread(target=pixel_animation_task, args=(delay,), daemon=True).start()
+        if not animation_frames: 
+            messagebox.showerror("Error", "No frames to animate.")
+            return
+        if not pixoo_upload:
+            messagebox.showerror("Error", "Not connected to Pixoo.")
+            return
+
+        try:
+            # Get the frame duration in milliseconds
+            fps = float(self.anim_fps_entry.get())
+            if fps <= 0: fps = 10.0
+            delay_ms = int(1000.0 / fps)
+
+            # Ensure a minimum delay
+            delay_ms = max(30, delay_ms) 
+
+            # Upload all frames at once
+            pixoo_upload.send_images(animation_frames, speed=delay_ms)
+
+            # Set the flag so "STOP ALL" works to clear the state
+            pixel_animation_active.set() 
+
+            # Update the preview with the first frame
+            self.load_image_to_canvas_data(animation_frames[0])
+            update_preview_label(animation_frames[0])
+
+        except ValueError:
+            messagebox.showerror("Error", "Please enter a valid number for FPS.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to play animation: {e}")
 
     def export_animation_as_gif(self):
         if len(animation_frames) < 2: messagebox.showwarning("Not an animation", "You need at least 2 frames to export a GIF."); return
@@ -2323,7 +2868,7 @@ class App(customtkinter.CTk):
         
         left_col = customtkinter.CTkFrame(frame, width=200)
         left_col.grid(row=0, column=0, sticky="nsw", padx=(0, 20))
-        
+
         tools_frame = customtkinter.CTkFrame(left_col)
         tools_frame.pack(fill="x", padx=10, pady=10)
         customtkinter.CTkLabel(tools_frame, text="Tools").pack()
@@ -2628,6 +3173,283 @@ class App(customtkinter.CTk):
 
         return frame
 
+    def create_gallery_frame(self):
+        frame = customtkinter.CTkFrame(self, fg_color="transparent")
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(5, weight=1)
+
+        customtkinter.CTkLabel(frame, text="Divoom Cloud Gallery Browser", font=self.large_font).grid(row=0, column=0, sticky="w", padx=10, pady=10)
+
+        # --- Authentication Frame ---
+        auth_frame = customtkinter.CTkFrame(frame)
+        auth_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 5))
+        auth_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.divoom_email_entry = customtkinter.CTkEntry(auth_frame, placeholder_text="Divoom Email")
+        self.divoom_email_entry.grid(row=0, column=0, padx=(10, 5), pady=5, sticky="ew")
+        self.divoom_password_entry = customtkinter.CTkEntry(auth_frame, placeholder_text="Divoom Password", show="*")
+        self.divoom_password_entry.grid(row=0, column=1, padx=(5, 10), pady=5, sticky="ew")
+        self.divoom_remember_me_var = customtkinter.BooleanVar()
+        self.divoom_remember_me_check = customtkinter.CTkCheckBox(auth_frame, text="Remember Me",
+                                                                 variable=self.divoom_remember_me_var)
+        self.divoom_remember_me_check.grid(row=1, column=0, padx=10, pady=(0, 5), sticky="w")
+        
+        # Auto-populate fields from config
+        if DIV_LOGIN_EMAIL:
+            self.divoom_email_entry.insert(0, DIV_LOGIN_EMAIL)
+        if DIV_LOGIN_PASSWORD:
+            self.divoom_password_entry.insert(0, DIV_LOGIN_PASSWORD)
+            self.divoom_remember_me_var.set(True)
+            
+        self.divoom_login_button = customtkinter.CTkButton(auth_frame, text="Login to Divoom Cloud", command=self._handle_divoom_login)
+        self.divoom_login_button.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 5), sticky="ew")
+        
+        self.divoom_login_status = customtkinter.CTkLabel(auth_frame, text="Cloud Status: Logged Out (Login Required)", text_color="orange")
+        self.divoom_login_status.grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 5), sticky="w")
+
+        # --- Controls Frame ---
+        control_frame = customtkinter.CTkFrame(frame)
+        control_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
+        # Adjusted column weights for new combo box
+        control_frame.grid_columnconfigure((0, 1, 2, 3, 4, 5, 6, 7), weight=1)
+
+        self.gallery_page_label = customtkinter.CTkLabel(control_frame, text="Page 1/1")
+        self.gallery_page_label.grid(row=0, column=0, padx=10, pady=5)
+        
+        self.gallery_prev_button = customtkinter.CTkButton(control_frame, text="< Prev", command=lambda: self.navigate_gallery(-1), state="disabled", width=60)
+        self.gallery_prev_button.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+
+        self.gallery_next_button = customtkinter.CTkButton(control_frame, text="Next >", command=lambda: self.navigate_gallery(1), state="disabled", width=60)
+        self.gallery_next_button.grid(row=0, column=2, padx=5, pady=5, sticky="ew")
+        
+        # Sort Option
+        customtkinter.CTkLabel(control_frame, text="Sort:").grid(row=0, column=3, padx=(10, 2), pady=5, sticky="e")
+        self.gallery_sort_var = customtkinter.StringVar(value="Latest")
+        self.gallery_sort_combobox = customtkinter.CTkComboBox(control_frame, values=["Latest", "Hottest"], variable=self.gallery_sort_var, width=90, command=lambda e: self.load_gallery_page(1))
+        self.gallery_sort_combobox.grid(row=0, column=4, padx=2, pady=5, sticky="ew")
+
+        # Size Option
+        customtkinter.CTkLabel(control_frame, text="Size:").grid(row=0, column=5, padx=(10, 2), pady=5, sticky="e")
+        self.gallery_size_var = customtkinter.StringVar(value="All")
+        # Maps to: All=0, 16=1, 32=2, 64=4, 128=16, 256=32
+        self.gallery_size_combobox = customtkinter.CTkComboBox(control_frame, values=["All", "16x16", "32x32", "64x64"], variable=self.gallery_size_var, width=100, command=lambda e: self.load_gallery_page(1))
+        self.gallery_size_combobox.grid(row=0, column=6, padx=2, pady=5, sticky="ew")
+
+        # Refresh Button - Reloads CURRENT page, not always page 1
+        self.gallery_refresh_button = customtkinter.CTkButton(control_frame, text="↻", width=30, command=lambda: self.load_gallery_page(self.current_gallery_page, force=True))
+        self.gallery_refresh_button.grid(row=0, column=7, padx=10, pady=5, sticky="ew")
+        
+        self.gallery_status_label = customtkinter.CTkLabel(frame, text="Status: Please Log In", text_color="red")
+        self.gallery_status_label.grid(row=4, column=0, sticky="w", padx=10)
+
+        self.gallery_scroll_frame = customtkinter.CTkScrollableFrame(frame, label_text="Artwork")
+        self.gallery_scroll_frame.grid(row=5, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self.gallery_scroll_frame.grid_columnconfigure((0, 1, 2, 3), weight=1) 
+        
+        return frame
+
+    def _handle_divoom_login(self):
+        email = self.divoom_email_entry.get().strip()
+        password = self.divoom_password_entry.get()
+
+        if not email or not password:
+            messagebox.showwarning("Missing Credentials", "Please enter your Divoom email and password.")
+            return
+
+        self.divoom_login_status.configure(text="Cloud Status: Logging in...", text_color="yellow")
+        self.divoom_login_button.configure(state="disabled")
+
+        def login_task():
+            global DIV_LOGIN_EMAIL, DIV_LOGIN_PASSWORD # Need globals here for saving
+            if divoom_cloud_login(email, password):
+                
+                if self.divoom_remember_me_var.get():
+                    DIV_LOGIN_EMAIL = email
+                    DIV_LOGIN_PASSWORD = password
+                else:
+                    DIV_LOGIN_EMAIL = ""
+                    DIV_LOGIN_PASSWORD = ""
+                save_config(app_config)
+                
+                self.after(0, self._update_divoom_login_status, True)
+                self.after(500, lambda: self.load_gallery_page(1)) # Auto-load gallery on success
+            else:
+                self.after(0, self._update_divoom_login_status, False)
+        
+        threading.Thread(target=login_task, daemon=True).start()
+
+    def _update_divoom_login_status(self, success: bool):
+        self.divoom_login_button.configure(state="normal")
+        if success:
+            self.divoom_login_status.configure(text=f"Cloud Status: Logged In (User {DIV_USER_ID})", text_color="green")
+            self.divoom_email_entry.configure(state="disabled")
+            self.divoom_password_entry.configure(state="disabled")
+            self.gallery_status_label.configure(text="Status: Loading Gallery...", text_color="grey")
+        else:
+            self.divoom_login_status.configure(text="Cloud Status: Login Failed (Check credentials)", text_color="red")
+            self.gallery_status_label.configure(text="Status: Authentication required to view gallery.", text_color="red")
+            
+    def load_gallery_page(self, page_num, force=False):
+        """Initiates the loading of a specific gallery page in a background thread."""
+        global DIV_TOKEN, DIV_USER_ID
+        
+        if not DIV_TOKEN or DIV_USER_ID == "0":
+            self.gallery_status_label.configure(text="Status: Please log in to Divoom Cloud first.", text_color="red")
+            return
+            
+        # Allow reload if forced (Refresh button), otherwise prevent double-loading
+        if not force and self.current_gallery_page == page_num and self.artwork_thumbnails: 
+            return 
+
+        self.gallery_status_label.configure(text=f"Status: Loading Page {page_num}...")
+        self.gallery_prev_button.configure(state="disabled")
+        self.gallery_next_button.configure(state="disabled")
+        self.gallery_refresh_button.configure(state="disabled")
+
+        # Clear existing tiles immediately to show activity
+        for widget in self.gallery_scroll_frame.winfo_children():
+            widget.destroy()
+        self.artwork_thumbnails.clear()
+
+        sort_value = 0 if self.gallery_sort_var.get() == "Latest" else 1
+        
+        # Get Size Value
+        size_str = self.gallery_size_var.get()
+        size_map = {"All": 0, "16x16": 1, "32x32": 2, "64x64": 4}
+        size_value = size_map.get(size_str, 0)
+        
+        threading.Thread(target=self._load_gallery_data_task, args=(page_num, sort_value, size_value), daemon=True).start()
+    
+    def navigate_gallery(self, direction):
+        """Handles Next/Prev buttons."""
+        new_page = self.current_gallery_page + direction
+        # Simple bounds check. Since we use infinite scroll logic, 
+        # total_gallery_pages will be (current + 1) if there's more content.
+        if new_page >= 1:
+             self.load_gallery_page(new_page)    
+
+    def _load_gallery_data_task(self, page_num, sort_value, size_value):
+        """Worker thread to fetch data and update the GUI."""
+        # Pass the size_value to the fetch function
+        art_list, total_pages = fetch_cloud_gallery_list(page=page_num, sort_type=sort_value, file_size=size_value)
+        
+        self.after(0, self._update_gallery_ui, art_list, total_pages, page_num)
+
+    def _update_gallery_ui(self, art_list, total_pages, page_num):
+        self.current_gallery_page = page_num
+        self.total_gallery_pages = total_pages
+        
+        row, col = 0, 0
+        thumb_size = 96
+        
+        # Clear previous buttons
+        for widget in self.gallery_scroll_frame.winfo_children():
+            widget.destroy()
+        
+        if not art_list:
+            self.gallery_status_label.configure(text="Status: No artwork found.", text_color="orange")
+            return
+            
+        for i, artwork in enumerate(art_list):
+
+            if artwork.get("IsHide") == 1:
+                continue
+
+            file_id = artwork.get("FileId")
+            if not file_id: file_id = artwork.get("GalleryId")
+            if not file_id: continue 
+            
+            file_name = artwork.get("FileName", str(file_id))
+            user_name = artwork.get("UserName", "Unknown")
+            
+            status_tags = ""
+            if artwork.get("IsNew") == 1:
+                status_tags += " 🆕" # New Upload / Rising
+            if artwork.get("IsRecommend") == 1:
+                status_tags += " 🌟" # Recommended / Featured
+            
+            tile_frame = customtkinter.CTkFrame(self.gallery_scroll_frame)
+            tile_frame.grid(row=row, column=col, padx=10, pady=10, sticky="ew")
+            
+            btn_command = lambda f_id=file_id, f_name=file_name: threading.Thread(target=display_cloud_artwork_task, args=(f_id, f_name), daemon=True).start()
+            
+            # Create Placeholder Button
+            img_button = customtkinter.CTkButton(tile_frame, text=f"Loading...", command=None, width=thumb_size, height=thumb_size)
+            img_button.pack(pady=(5, 0), padx=5)
+
+            # Start Lazy Loader
+            threading.Thread(target=self.lazy_load_thumbnail, args=(file_id, img_button, artwork), daemon=True).start()
+
+            # Add the status tags to the label
+            label_text = f"{file_name}\nby {user_name}{status_tags}"
+            
+            # Set recommended colour and icon
+            text_color = "orange" if "🌟" in status_tags else ("white")
+            
+            details_label = customtkinter.CTkLabel(tile_frame, text=label_text, text_color=text_color, anchor="center", justify="center", wraplength=thumb_size + 20, font=self.label_font)
+            details_label.pack(pady=(0, 5), padx=5)
+
+            col += 1
+            if col > 3: 
+                col = 0
+                row += 1
+
+        self.gallery_page_label.configure(text=f"Page {page_num}/{total_pages}")
+        self.gallery_prev_button.configure(state="normal" if page_num > 1 else "disabled")
+        self.gallery_next_button.configure(state="normal" if page_num < total_pages else "disabled")
+        self.gallery_refresh_button.configure(state="normal")
+        self.gallery_status_label.configure(text="Status: Ready")
+
+    def _update_button_image(self, file_id, pil_img, btn_widget, artwork_data):
+        """Run on main thread to create UI image and set its command."""
+        try:
+            ctk_thumb = customtkinter.CTkImage(light_image=pil_img, dark_image=pil_img, size=(96, 96))
+            
+            # Cache it
+            self.artwork_thumbnails[str(file_id)] = ctk_thumb
+            btn_command = lambda data=artwork_data, thumb=pil_img: self.open_details_page(data, thumb)
+            
+            # Update Button
+            btn_widget.configure(
+                image=ctk_thumb, 
+                text="", 
+                state="normal", 
+                fg_color="transparent",
+                command=btn_command  # <-- Set the command here
+            )
+            
+        except Exception as e:
+            logging.error(f"[Thumb] UI Update failed for {file_id}: {e}")
+
+    def lazy_load_thumbnail(self, file_id, btn_widget, artwork_data):
+        """Background task to download .dat, extract frame 1, and update the button."""
+        try:
+            # Check Cache
+            if str(file_id) in self.artwork_thumbnails:
+                 thumb_img = self.artwork_thumbnails[str(file_id)]
+                 self.after(0, lambda: btn_widget.configure(image=thumb_img, text=""))
+                 return
+
+            url = f"{DIV_FILE_URL}/{file_id}"
+            resp = requests.get(url, timeout=10)
+            
+            if resp.status_code == 200:
+                pixel_bean = PixelBeanDecoder.decode_stream(io.BytesIO(resp.content))
+                
+                if pixel_bean:
+                    img = pixel_bean.get_frame_image(1).convert("RGB")
+                    img = img.resize((96, 96), Image.Resampling.NEAREST)
+
+                    # Pass to main thread
+                    self.after(0, lambda: self._update_button_image(file_id, img, btn_widget, artwork_data))
+                else:
+                    logging.warning(f"[Thumb] Decode returned None for {file_id}")
+            else:
+                logging.warning(f"[Thumb] HTTP {resp.status_code} for {file_id}")
+                    
+        except Exception as e:
+            logging.warning(f"[Thumb] Failed for {file_id}: {e}")
+
     def create_credits_frame(self):
         frame = customtkinter.CTkFrame(self, fg_color="transparent")
         frame.grid_rowconfigure(0, weight=1)
@@ -2643,24 +3465,244 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
         customtkinter.CTkLabel(center_frame, text="by Doug Farmer", font=author_font).pack()
-        customtkinter.CTkLabel(center_frame, text="Version 2.8", font=author_font).pack(pady=(0, 10))
+        customtkinter.CTkLabel(center_frame, text="Version 3.0", font=author_font).pack(pady=(0, 10))
 
         customtkinter.CTkLabel(center_frame, text="Special Thanks", font=header_font).pack(pady=(20, 5))
-        customtkinter.CTkLabel(center_frame, text="All credit for the foundational concept and starting point goes to MikeTheTech.\nThis tool was built and expanded upon his great work.", font=body_font, justify="center").pack()
+        customtkinter.CTkLabel(center_frame, text="MikeTheTech", font=body_font, justify="center").pack()
+        customtkinter.CTkLabel(center_frame, text="Fabkury", font=body_font, justify="center").pack()
+        customtkinter.CTkLabel(center_frame, text="redphx", font=body_font, justify="center").pack()
 
         customtkinter.CTkLabel(center_frame, text="https://github.com/tidyhf/Pixoo64-Advanced-Tools", font=author_font).pack(pady=30)
 
         return frame
 
+    def open_details_page(self, artwork_data, thumbnail_image):
+        """Creates a new Toplevel window to show artwork details, GIF, and comments."""
+    
+        file_id = artwork_data.get("FileId")
+        file_name = artwork_data.get("FileName", str(file_id))
+        gallery_id = artwork_data.get("GalleryId", 0)
+        like_count = artwork_data.get("LikeCnt", 0) # Get the like count
+
+        # Create the new pop-up window
+        details_window = customtkinter.CTkToplevel(self)
+        details_window.title(f"Details: {file_name}")
+        details_window.geometry("800x600")
+        
+        # Create a threading Event to signal the background threads to stop
+        stop_event = threading.Event()
+        
+        # Make window modal and link to parent
+        details_window.transient(self)
+        details_window.grab_set()
+        
+        # When the 'X' button is clicked, set the event and then destroy the window
+        def on_popup_close():
+            logging.info("Popup closing, setting stop event for threads.")
+            stop_event.set()
+            details_window.destroy()
+        
+        details_window.protocol("WM_DELETE_WINDOW", on_popup_close)
+
+        # Configure main grid
+        details_window.grid_rowconfigure(2, weight=1) # Row 2 (tabs) is now weighted
+        details_window.grid_columnconfigure(1, weight=1)
+
+        # --- Title ---
+        title_label = customtkinter.CTkLabel(details_window, text=file_name, font=self.large_font)
+        title_label.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+
+        # --- Animated GIF Preview (Left Column) ---
+        gif_preview_label = customtkinter.CTkLabel(details_window, text="Loading animation...", width=256, height=256)
+        gif_preview_label.grid(row=1, column=0, padx=10, pady=10, sticky="n")
+        # Show the static thumbnail immediately
+        preview_img = customtkinter.CTkImage(light_image=thumbnail_image, dark_image=thumbnail_image, size=(256, 256))
+        gif_preview_label.configure(image=preview_img)
+        
+        # --- Likes Label ---
+        like_label = customtkinter.CTkLabel(details_window, text=f"❤️ {like_count}", font=self.large_font)
+        like_label.grid(row=2, column=0, padx=10, pady=0, sticky="n")
+    
+        # --- Right Pane (Tabs) ---
+        right_pane = customtkinter.CTkFrame(details_window, fg_color="transparent")
+        right_pane.grid(row=1, column=1, rowspan=2, padx=10, pady=(0, 10), sticky="nsew") # Spans 2 rows
+        right_pane.grid_rowconfigure(0, weight=1)
+        right_pane.grid_columnconfigure(0, weight=1)
+
+        tab_view = customtkinter.CTkTabview(right_pane)
+        tab_view.grid(row=0, column=0, sticky="nsew")
+        tab_view.add("Comments")
+
+        # --- Comments Tab ---
+        comments_frame = customtkinter.CTkScrollableFrame(tab_view.tab("Comments"))
+        comments_frame.pack(fill="both", expand=True)
+
+        # --- Internal helper for animation ---
+        def _animate_gif_on_label(label_widget, frames, delay_ms, stop_event):
+            try:
+                frame_idx = 0
+                while not stop_event.is_set():
+                    frame_image = frames[frame_idx]
+                    photo_image = ImageTk.PhotoImage(frame_image)
+                    
+                    try:
+                        label_widget.after(0, lambda w=label_widget, img=photo_image: w.configure(image=img))
+                    except Exception:
+                        # Widget was destroyed, stop the loop
+                        logging.info("Animation label widget destroyed, stopping animation thread.")
+                        break
+                    
+                    label_widget.image = photo_image 
+                    frame_idx = (frame_idx + 1) % len(frames)
+                    
+                    stop_event.wait(delay_ms / 1000.0)
+            except Exception:
+                logging.info("Animation label thread stopped (widget destroyed).")
+
+        # --- Bottom Button Bar ---
+        button_frame = customtkinter.CTkFrame(details_window, fg_color="transparent")
+        button_frame.grid(row=3, column=0, columnspan=2, padx=10, pady=10, sticky="ew") # Now in Row 3
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        display_button = customtkinter.CTkButton(button_frame, text="Display on Pixoo", height=40,
+                                                 command=lambda f_id=file_id, f_name=file_name: threading.Thread(target=display_cloud_artwork_task, args=(f_id, f_name), daemon=True).start())
+        display_button.grid(row=0, column=0, padx=(0, 5), sticky="ew")
+
+        download_button = customtkinter.CTkButton(button_frame, text="Download", height=40,
+                                                command=lambda w=details_window, f_name=file_name: self.handle_artwork_download(w, f_name))
+        download_button.grid(row=0, column=1, padx=(5, 0), sticky="ew")
+
+
+        # --- BACKGROUND LOADING THREAD ---
+        def load_details_task(stop_event):
+            # 1. Download and Decode .dat file
+            pixel_bean = None
+            try:
+                if stop_event.is_set(): return
+                pixel_bean = download_and_decode_pixel_bean(file_id)
+                # Store the bean for the download button
+                if details_window.winfo_exists():
+                    details_window.pixel_bean = pixel_bean 
+            except Exception as e:
+                logging.error(f"Failed to download/decode bean: {e}")
+                if not stop_event.is_set():
+                    try: gif_preview_label.after(0, lambda: gif_preview_label.configure(text="Error loading preview."))
+                    except Exception: pass
+            
+            if stop_event.is_set(): return
+
+            if pixel_bean and pixel_bean.total_frames > 1:
+                frames = []
+                for i in range(1, pixel_bean.total_frames + 1):
+                    img = pixel_bean.get_frame_image(i).resize((256, 256), Image.Resampling.NEAREST)
+                    frames.append(img)
+                
+                # Clear "loading" text and start animation
+                try: gif_preview_label.after(0, lambda: gif_preview_label.configure(text=""))
+                except Exception: pass
+                
+                if stop_event.is_set(): return
+                threading.Thread(target=_animate_gif_on_label, args=(gif_preview_label, frames, pixel_bean.speed, stop_event), daemon=True).start()
+            
+            elif pixel_bean:
+                # Static image, just update the preview and clear text
+                img = pixel_bean.get_frame_image(1).resize((256, 256), Image.Resampling.NEAREST)
+                ctk_img = customtkinter.CTkImage(light_image=img, dark_image=img, size=(256, 256))
+                try: gif_preview_label.after(0, lambda: gif_preview_label.configure(image=ctk_img, text=""))
+                except Exception: pass
+
+            if stop_event.is_set(): return
+
+            # 2. Fetch Comments (with error handling)
+            try: comments_frame.after(0, lambda: customtkinter.CTkLabel(comments_frame, text="Loading comments...").pack(anchor="w", padx=5, pady=2))
+            except Exception: pass
+            
+            try:
+                comments = fetch_artwork_comments(gallery_id)
+                if stop_event.is_set(): return
+
+                try: comments_frame.after(0, lambda: [widget.destroy() for widget in comments_frame.winfo_children()])
+                except Exception: pass
+                
+                for comment in comments:
+                    if stop_event.is_set(): break
+                    try: comments_frame.after(0, lambda c=comment: customtkinter.CTkLabel(comments_frame, text=c, wraplength=350, justify="left", anchor="w").pack(anchor="w", fill="x", padx=5, pady=5))
+                    except Exception: pass
+            except Exception as e:
+                logging.error(f"Failed to load comments: {e}")
+                if not stop_event.is_set():
+                    try:
+                        comments_frame.after(0, lambda: [widget.destroy() for widget in comments_frame.winfo_children()])
+                        comments_frame.after(0, lambda: customtkinter.CTkLabel(comments_frame, text="Error loading comments.", text_color="red").pack(anchor="w", padx=5, pady=2))
+                    except Exception: pass
+
+        # Start the background loading
+        threading.Thread(target=load_details_task, args=(stop_event,), daemon=True).start()
+        
+    def handle_artwork_download(self, details_window, file_name):
+        """Saves the artwork from the details page pop-up."""
+        if not hasattr(details_window, 'pixel_bean') or not details_window.pixel_bean:
+            messagebox.showerror("Error", "Artwork data (PixelBean) is not loaded yet. Please wait.", parent=details_window)
+            return
+
+        pixel_bean = details_window.pixel_bean
+        
+        # Sanitize filename
+        safe_name = "".join(c for c in file_name if c.isalnum() or c in (" ", "_", "-")).rstrip()
+        if not safe_name:
+            safe_name = str(int(time.time()))
+
+        # Determine file type
+        if pixel_bean.total_frames > 1:
+            default_ext = ".gif"
+            file_types = [("Animated GIF", "*.gif")]
+            initial_file = f"{safe_name}.gif"
+        else:
+            default_ext = ".png"
+            file_types = [("PNG Image", "*.png")]
+            initial_file = f"{safe_name}.png"
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=default_ext,
+            filetypes=file_types,
+            title="Save Artwork As",
+            initialfile=initial_file,
+            parent=details_window # Ensure dialog is on top
+        )
+        
+        if not path:
+            return # User cancelled
+
+        try:
+            if pixel_bean.total_frames > 1:
+                # Save as GIF
+                frames = []
+                for i in range(1, pixel_bean.total_frames + 1):
+                    frames.append(pixel_bean.get_frame_image(i).convert("RGB"))
+                
+                duration_ms = max(30, pixel_bean.speed) # Divoom speed is in ms
+                frames[0].save(path, save_all=True, append_images=frames[1:], duration=duration_ms, loop=0)
+            else:
+                # Save as PNG
+                img = pixel_bean.get_frame_image(1)
+                img.save(path, "PNG")
+            
+            messagebox.showinfo("Success", f"Artwork saved successfully to:\n{path}", parent=details_window)
+        except Exception as e:
+            logging.error(f"Failed to save artwork: {e}")
+            messagebox.showerror("Error", f"Failed to save artwork:\n{e}", parent=details_window)
+
 
     def on_closing(self):
         stop_all_activity()
+        # IMPORTANT: Clear references to customtkinter images before closing
+        if hasattr(self, 'artwork_thumbnails'):
+            self.artwork_thumbnails.clear() # Corrected indentation here
         save_config(app_config)
         if NVIDIA_GPU_SUPPORT:
             pynvml.nvmlShutdown()
         self.destroy()
-
-
+        
 if __name__ == "__main__":
     app = App()
     app.mainloop()
