@@ -4,7 +4,7 @@ An advanced Python toolset for customizing and interacting with the Divoom Pixoo
 
 Version 3.0 now live!
 
-![hippo](https://i.imgur.com/LbG1xKj.gif)
+![hippo](https://images2.imgbox.com/67/3a/tdlpqypn_o.gif)
 ---
 
 ## 🚀 Overview
