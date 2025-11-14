@@ -28,7 +28,7 @@ This project is an enhanced toolset for the Divoom Pixoo 64, it provides advance
 - **Webcam Streamer**: Stream your webcam live and save frame for easy display, with added shuffle and import/export functions!
 - **Pixel Designer**: Fully featured pixel designer with animation support added!
 - **Spotify Album Art** Displays the album art, progress bar and Lyrics! Work in progress, will improve later.
-- _NEW!_ **Divoom Cloud Gallery** Log in with your Divoom account to have access to the entire Divoom Cloud Library with support for likes and comments!
+- _NEW!_ **Divoom Cloud Gallery** Log in with your Divoom account to have access to the entire Divoom Cloud Library with advanced insight into new/recommended artwork, likes and comments!
 
 ---
 
