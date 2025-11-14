@@ -3352,7 +3352,7 @@ class App(customtkinter.CTk):
             
         for i, artwork in enumerate(art_list):
 
-            if artwork.get("IsHide") == 1:
+            if artwork.get("HideFlag") == 1:
                 continue
 
             file_id = artwork.get("FileId")
@@ -3363,9 +3363,9 @@ class App(customtkinter.CTk):
             user_name = artwork.get("UserName", "Unknown")
             
             status_tags = ""
-            if artwork.get("IsNew") == 1:
+            if artwork.get("IsAddNew") == 1:
                 status_tags += " 🆕" # New Upload / Rising
-            if artwork.get("IsRecommend") == 1:
+            if artwork.get("IsAddRecommend") == 1:
                 status_tags += " 🌟" # Recommended / Featured
             
             tile_frame = customtkinter.CTkFrame(self.gallery_scroll_frame)
