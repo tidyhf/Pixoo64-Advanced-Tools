@@ -11,3 +11,4 @@ spotipy
 icalendar
 pycryptodome
 lzallright
+pytz
