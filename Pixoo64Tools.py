@@ -1,6 +1,6 @@
 
 #
-# Pixoo 64 Advanced Tools by Doug Farmer (v3.0)
+# Pixoo 64 Advanced Tools by Doug Farmer (v3.1)
 #
 # A Python application with a graphical user interface (GUI) to control a Divoom Pixoo 64 display.
 # This script allows for AI image generation, screen streaming, video playback, single image/GIF display,
@@ -728,37 +728,34 @@ def standalone_gif_task():
         durations = []
         with Image.open(current_gif_path) as gif:
             for frame_image in ImageSequence.Iterator(gif):
-                # Get duration
                 duration = frame_image.info.get('duration', 100)
                 durations.append(duration)
                 
-                # Process frame
                 converted_frame = frame_image.convert("RGB")
                 processed_frame = process_image(converted_frame)
                 frames.append(processed_frame)
 
         if not frames:
             messagebox.showerror("GIF Error", "Could not load any frames from the GIF.")
+            app.toggle_processing_controls(enabled=True) # Re-enable on error
             return
 
-        # Use the average duration for the 'speed' parameter
         avg_duration = sum(durations) / len(durations) if durations else 100
-        avg_duration = max(30, int(avg_duration)) # Ensure a minimum delay
+        avg_duration = max(30, int(avg_duration))
 
         app.gif_path_label.configure(text=f"Uploading: {os.path.basename(current_gif_path)}...")
         
-        # Upload the list of frames as an animation
         pixoo_upload.send_images(frames, speed=avg_duration)
         
         app.gif_path_label.configure(text=f"Playing: {os.path.basename(current_gif_path)}")
-        gif_active.set() # Set the flag so "STOP ALL" works
+        gif_active.set() 
+        logging.info("GIF upload complete.")
 
     except Exception as e:
         messagebox.showerror("GIF Error", f"Could not process or play GIF: {e}")
         app.gif_path_label.configure(text=f"Selected: {os.path.basename(current_gif_path)}")
-    finally:
         app.toggle_processing_controls(enabled=True)
-        logging.info("GIF playback (upload) finished.")
+        logging.error(f"GIF task failed: {e}")
 
 def video_playback_task():
     if not current_video_path: return
@@ -1686,7 +1683,7 @@ class App(customtkinter.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Pixoo 64 Advanced Tools 3.0")
+        self.title("Pixoo 64 Advanced Tools 3.1")
         self.geometry("1440x810")
 
         customtkinter.set_appearance_mode("Dark")
@@ -3465,7 +3462,7 @@ class App(customtkinter.CTk):
 
         customtkinter.CTkLabel(center_frame, text="Pixoo 64 Advanced Tools", font=title_font).pack(pady=(10, 0))
         customtkinter.CTkLabel(center_frame, text="by Doug Farmer", font=author_font).pack()
-        customtkinter.CTkLabel(center_frame, text="Version 3.0", font=author_font).pack(pady=(0, 10))
+        customtkinter.CTkLabel(center_frame, text="Version 3.1", font=author_font).pack(pady=(0, 10))
 
         customtkinter.CTkLabel(center_frame, text="Special Thanks", font=header_font).pack(pady=(20, 5))
         customtkinter.CTkLabel(center_frame, text="MikeTheTech", font=body_font, justify="center").pack()
